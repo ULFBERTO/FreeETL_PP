@@ -54,7 +54,8 @@ class NodePalette(QWidget):
             ("Filtro", "transform", "filter"),
             ("Unión", "transform", "join"),
             ("Agregación", "transform", "aggregate"),
-            ("Mapeo", "transform", "map")
+            ("Mapeo", "transform", "map"),
+            ("Casteo", "transform", "cast")
         ]
         
         for name, node_type, subtype in transform_buttons:

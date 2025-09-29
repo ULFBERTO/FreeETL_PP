@@ -56,7 +56,12 @@ class ETLEngine(QObject):
             df = config['dataframe']
             if isinstance(df, pd.DataFrame):
                 df = pl.from_pandas(df)
-            return self._apply_select_and_rename(df, config)
+            res = self._apply_select_and_rename(df, config)
+            try:
+                self.execution_progress.emit(f"Nodo origen {node_id} columnas: {list(res.columns)}")
+            except Exception:
+                pass
+            return res
 
         try:
             if subtype == 'csv':
@@ -64,7 +69,12 @@ class ETLEngine(QObject):
                 if not path:
                     raise ValueError(f"No se especificó ruta de archivo para el nodo {node_id}")
                 df = pl.read_csv(path)
-                return self._apply_select_and_rename(df, config)
+                res = self._apply_select_and_rename(df, config)
+                try:
+                    self.execution_progress.emit(f"Nodo origen {node_id} columnas: {list(res.columns)}")
+                except Exception:
+                    pass
+                return res
 
             elif subtype == 'excel':
                 path = config.get('path')
@@ -76,7 +86,12 @@ class ETLEngine(QObject):
                 except Exception:
                     pdf = pd.read_excel(path)
                     df = pl.from_pandas(pdf)
-                return self._apply_select_and_rename(df, config)
+                res = self._apply_select_and_rename(df, config)
+                try:
+                    self.execution_progress.emit(f"Nodo origen {node_id} columnas: {list(res.columns)}")
+                except Exception:
+                    pass
+                return res
 
             elif subtype == 'json':
                 path = config.get('path')
@@ -103,7 +118,12 @@ class ETLEngine(QObject):
                 if not path:
                     raise ValueError(f"No se especificó ruta de archivo para el nodo {node_id}")
                 df = pl.read_parquet(path)
-                return self._apply_select_and_rename(df, config)
+                res = self._apply_select_and_rename(df, config)
+                try:
+                    self.execution_progress.emit(f"Nodo origen {node_id} columnas: {list(res.columns)}")
+                except Exception:
+                    pass
+                return res
 
             elif subtype == 'database':
                 db_type = config.get('db_type')
@@ -118,8 +138,41 @@ class ETLEngine(QObject):
 
                 conn_str = self._build_connection_string(db_type, host, port, user, password, database)
                 self.execution_progress.emit(f"Leyendo desde base de datos ({db_type})...")
-                df = self._read_sql(conn_str, query)
-                return self._apply_select_and_rename(df, config)
+                try:
+                    if (db_type or '').lower() == 'mysql':
+                        # Crear engine con (posible) SSL según config
+                        engine = self._make_sqlalchemy_engine(db_type, conn_str, config)
+                        pdf = pd.read_sql_query(query, engine)
+                    else:
+                        # Camino estándar
+                        df = self._read_sql(conn_str, query)
+                        res = self._apply_select_and_rename(df, config)
+                        try:
+                            self.execution_progress.emit(f"Nodo origen {node_id} columnas: {list(res.columns)}")
+                        except Exception:
+                            pass
+                        return res
+                except Exception as e:
+                    # Reintentar con modo SSL opuesto si parece error de SSL y es MySQL
+                    if (db_type or '').lower() == 'mysql' and self._should_retry_ssl(e, config):
+                        try:
+                            retry_mode = 'DISABLED' if self._was_ssl_enabled(config) else 'REQUIRED'
+                            engine = self._make_sqlalchemy_engine(db_type, conn_str, config, ssl_mode_override=retry_mode)
+                            pdf = pd.read_sql_query(query, engine)
+                            self.execution_progress.emit(f"Reintento MySQL con SSL='{retry_mode}' exitoso")
+                        except Exception:
+                            self.execution_progress.emit(f"Fallo reintento MySQL cambiando SSL: {e}")
+                            raise
+                    else:
+                        raise
+                # Convertir a Polars y aplicar selección/renombrado
+                df = pl.from_pandas(pdf)
+                res = self._apply_select_and_rename(df, config)
+                try:
+                    self.execution_progress.emit(f"Nodo origen {node_id} columnas: {list(res.columns)}")
+                except Exception:
+                    pass
+                return res
 
             elif subtype == 'api':
                 url = config.get('url')
@@ -138,7 +191,12 @@ class ETLEngine(QObject):
                     try:
                         from io import BytesIO
                         df = pl.read_csv(BytesIO(resp.content))
-                        return self._apply_select_and_rename(df, config)
+                        res = self._apply_select_and_rename(df, config)
+                        try:
+                            self.execution_progress.emit(f"Nodo origen {node_id} columnas: {list(res.columns)}")
+                        except Exception:
+                            pass
+                        return res
                     except Exception:
                         raise ValueError("La respuesta de la API no es JSON ni CSV soportado")
                 # Normalizar JSON
@@ -169,122 +227,255 @@ class ETLEngine(QObject):
         result_df = df
         try:
             if subtype == 'filter':
-                filter_expr = config.get('filter_expr')
-                if filter_expr:
-                    expr_str = filter_expr.strip()
-                    if '>' in expr_str:
-                        col, val = expr_str.split('>')
-                        col = col.strip()
-                        val = float(val.strip())
-                        result_df = df.filter(pl.col(col) > val)
-                    elif '<' in expr_str:
-                        col, val = expr_str.split('<')
-                        col = col.strip()
-                        val = float(val.strip())
-                        result_df = df.filter(pl.col(col) < val)
-                    elif '==' in expr_str:
-                        col, val = expr_str.split('==')
-                        col = col.strip()
-                        val = val.strip()
-                        try:
-                            val = float(val)
-                            result_df = df.filter(pl.col(col) == val)
-                        except Exception:
-                            result_df = df.filter(pl.col(col) == val)
-                    else:
-                        self.execution_progress.emit(f"Expresión de filtro no soportada: {expr_str}")
+                # Modo nuevo: reglas estructuradas
+                rules = config.get('filter_rules')
+                mode = (config.get('filter_mode') or 'all').lower()  # 'all' (AND) o 'any' (OR)
+                if isinstance(rules, list) and rules:
+                    try:
+                        result_df = self._execute_filter_rules(df, rules, mode)
+                    except Exception as e:
+                        self.execution_progress.emit(f"Error aplicando reglas de filtro: {e}")
                         result_df = df
                 else:
-                    self.execution_progress.emit(f"No se especificó expresión de filtro para nodo {node_id}")
-                    result_df = df
+                    # Compatibilidad: expresión antigua en texto simple
+                    filter_expr = config.get('filter_expr')
+                    if filter_expr:
+                        expr_str = str(filter_expr).strip()
+                        try:
+                            # Soporte simple para >, <, ==, !=, >=, <=
+                            ops = ['>=', '<=', '==', '!=', '>', '<']
+                            op = next((o for o in ops if o in expr_str), None)
+                            if op:
+                                col, val = expr_str.split(op, 1)
+                                col = col.strip()
+                                val_str = val.strip()
+                                try:
+                                    val_num = float(val_str)
+                                    rhs = val_num
+                                except Exception:
+                                    rhs = val_str
+                                if op == '>':
+                                    result_df = df.filter(pl.col(col) > rhs)
+                                elif op == '<':
+                                    result_df = df.filter(pl.col(col) < rhs)
+                                elif op == '==':
+                                    result_df = df.filter(pl.col(col) == rhs)
+                                elif op == '!=':
+                                    result_df = df.filter(pl.col(col) != rhs)
+                                elif op == '>=':
+                                    result_df = df.filter(pl.col(col) >= rhs)
+                                elif op == '<=':
+                                    result_df = df.filter(pl.col(col) <= rhs)
+                            else:
+                                self.execution_progress.emit(f"Expresión de filtro no soportada: {expr_str}")
+                                result_df = df
+                        except Exception as e:
+                            self.execution_progress.emit(f"Error aplicando filtro: {e}")
+                            result_df = df
+                    else:
+                        self.execution_progress.emit(f"No se especificó filtro para nodo {node_id}")
+                        result_df = df
 
             elif subtype == 'join':
-                if 'join_cols' in config and 'other_dataframe' in config:
-                    join_cols = [col.strip() for col in str(config['join_cols']).split(',') if col.strip()]
-                    other_df = config['other_dataframe']
-                    if isinstance(other_df, pd.DataFrame):
-                        other_df = pl.from_pandas(other_df)
-                    join_type = (config.get('join_type', 'Inner') or 'Inner').lower()
-
-                    if join_type == 'inner':
-                        result_df = df.join(other_df, on=join_cols, how='inner')
-                    elif join_type == 'left':
-                        result_df = df.join(other_df, on=join_cols, how='left')
-                    elif join_type == 'right':
-                        result_df = df.join(other_df, on=join_cols, how='right')
-                    elif join_type == 'outer':
-                        result_df = df.join(other_df, on=join_cols, how='outer')
-                    else:
-                        result_df = df.join(other_df, on=join_cols, how='inner')
+                if 'other_dataframe' in config:
+                    # Ejecutar join con selección/renombrado consistente
+                    return self._execute_join(df, config)
                 else:
                     self.execution_progress.emit(f"Faltan parámetros para realizar join en nodo {node_id}")
                     result_df = df
 
             elif subtype == 'aggregate':
-                if 'group_by' in config and 'agg_funcs' in config:
-                    group_cols = [col.strip() for col in str(config['group_by']).split(',') if col.strip()]
-                    agg_exprs = []
-                    for agg_expr in str(config['agg_funcs']).split(','):
-                        if '(' in agg_expr and ')' in agg_expr:
-                            func, col = agg_expr.strip().split('(')
-                            col = col.replace(')', '').strip()
-                            if func.lower() == 'sum':
-                                agg_exprs.append(pl.sum(col))
-                            elif func.lower() in ('avg', 'mean'):
-                                agg_exprs.append(pl.mean(col))
-                            elif func.lower() == 'min':
-                                agg_exprs.append(pl.min(col))
-                            elif func.lower() == 'max':
-                                agg_exprs.append(pl.max(col))
-                            elif func.lower() == 'count':
-                                agg_exprs.append(pl.count())
-                    if group_cols and agg_exprs:
-                        result_df = df.group_by(group_cols).agg(agg_exprs)
-                    else:
-                        self.execution_progress.emit(f"Expresiones de agregación inválidas en nodo {node_id}")
+                # Modo nuevo: configuración estructurada
+                group_cols_struct = config.get('group_by_list')
+                aggs_struct = config.get('aggs')
+                if isinstance(group_cols_struct, list) and isinstance(aggs_struct, list):
+                    try:
+                        agg_exprs = []
+                        for agg in aggs_struct:
+                            func = str(agg.get('func', '')).lower()
+                            col = agg.get('col')
+                            alias = agg.get('as') or None
+                            if not col:
+                                continue
+                            expr = None
+                            if func == 'sum':
+                                expr = pl.sum(col)
+                            elif func in ('avg', 'mean'):
+                                expr = pl.mean(col)
+                            elif func == 'min':
+                                expr = pl.min(col)
+                            elif func == 'max':
+                                expr = pl.max(col)
+                            elif func == 'count':
+                                expr = pl.count()
+                            if expr is not None and alias:
+                                expr = expr.alias(alias)
+                            if expr is not None:
+                                agg_exprs.append(expr)
+                        group_cols = [c for c in group_cols_struct if isinstance(c, str) and c]
+                        if group_cols and agg_exprs:
+                            result_df = df.group_by(group_cols).agg(agg_exprs)
+                        else:
+                            self.execution_progress.emit(f"Configuración de agregación inválida en nodo {node_id}")
+                            result_df = df
+                    except Exception as e:
+                        self.execution_progress.emit(f"Error en agregación: {e}")
                         result_df = df
                 else:
-                    self.execution_progress.emit(f"Faltan parámetros para agregación en nodo {node_id}")
-                    result_df = df
+                    # Compatibilidad: strings antiguos
+                    if 'group_by' in config and 'agg_funcs' in config:
+                        group_cols = [col.strip() for col in str(config['group_by']).split(',') if col.strip()]
+                        agg_exprs = []
+                        for agg_expr in str(config['agg_funcs']).split(','):
+                            if '(' in agg_expr and ')' in agg_expr:
+                                func, col = agg_expr.strip().split('(')
+                                col = col.replace(')', '').strip()
+                                if func.lower() == 'sum':
+                                    agg_exprs.append(pl.sum(col))
+                                elif func.lower() in ('avg', 'mean'):
+                                    agg_exprs.append(pl.mean(col))
+                                elif func.lower() == 'min':
+                                    agg_exprs.append(pl.min(col))
+                                elif func.lower() == 'max':
+                                    agg_exprs.append(pl.max(col))
+                                elif func.lower() == 'count':
+                                    agg_exprs.append(pl.count())
+                        if group_cols and agg_exprs:
+                            result_df = df.group_by(group_cols).agg(agg_exprs)
+                        else:
+                            self.execution_progress.emit(f"Expresiones de agregación inválidas en nodo {node_id}")
+                            result_df = df
+                    else:
+                        self.execution_progress.emit(f"Faltan parámetros para agregación en nodo {node_id}")
+                        result_df = df
 
             elif subtype == 'map':
-                if 'map_expr' in config and config['map_expr']:
-                    map_expr = str(config['map_expr']).strip()
-                    if '=' in map_expr:
-                        new_col, expr = map_expr.split('=', 1)
-                        new_col = new_col.strip()
-                        expr = expr.strip()
-                        if '+' in expr:
-                            cols = [c.strip() for c in expr.split('+')]
-                            if len(cols) >= 2:
-                                result_df = df.with_columns((pl.col(cols[0]) + pl.col(cols[1])).alias(new_col))
-                        elif '-' in expr:
-                            cols = [c.strip() for c in expr.split('-')]
-                            if len(cols) >= 2:
-                                result_df = df.with_columns((pl.col(cols[0]) - pl.col(cols[1])).alias(new_col))
-                        elif '*' in expr:
-                            cols = [c.strip() for c in expr.split('*')]
-                            if len(cols) >= 2:
-                                result_df = df.with_columns((pl.col(cols[0]) * pl.col(cols[1])).alias(new_col))
-                        elif '/' in expr:
-                            cols = [c.strip() for c in expr.split('/')]
-                            if len(cols) >= 2:
-                                result_df = df.with_columns((pl.col(cols[0]) / pl.col(cols[1])).alias(new_col))
+                # Modo nuevo: operaciones estructuradas
+                ops = config.get('map_ops')
+                if isinstance(ops, list) and ops:
+                    try:
+                        exprs = []
+                        for op in ops:
+                            new_col = op.get('new_col')
+                            op_type = str(op.get('op_type', '')).lower()
+                            a = op.get('a')
+                            b = op.get('b')
+                            val = op.get('value')
+                            expr = None
+                            if not new_col:
+                                continue
+                            if op_type == 'add' and a and b:
+                                expr = (pl.col(a) + pl.col(b)).alias(new_col)
+                            elif op_type == 'sub' and a and b:
+                                expr = (pl.col(a) - pl.col(b)).alias(new_col)
+                            elif op_type == 'mul' and a and b:
+                                expr = (pl.col(a) * pl.col(b)).alias(new_col)
+                            elif op_type == 'div' and a and b:
+                                expr = (pl.col(a) / pl.col(b)).alias(new_col)
+                            elif op_type == 'concat' and a and b:
+                                expr = (pl.col(a).cast(pl.Utf8) + pl.col(b).cast(pl.Utf8)).alias(new_col)
+                            elif op_type == 'literal' and val is not None:
+                                expr = pl.lit(val).alias(new_col)
+                            elif op_type == 'copy' and a:
+                                expr = pl.col(a).alias(new_col)
+                            elif op_type == 'upper' and a:
+                                expr = pl.col(a).cast(pl.Utf8).str.to_uppercase().alias(new_col)
+                            elif op_type == 'lower' and a:
+                                expr = pl.col(a).cast(pl.Utf8).str.to_lowercase().alias(new_col)
+                            elif op_type == 'length' and a:
+                                expr = pl.col(a).cast(pl.Utf8).str.len_chars().alias(new_col)
+                            if expr is not None:
+                                exprs.append(expr)
+                        if exprs:
+                            result_df = df.with_columns(exprs)
+                        else:
+                            result_df = df
+                    except Exception as e:
+                        self.execution_progress.emit(f"Error en mapeo estructurado: {e}")
+                        result_df = df
+                else:
+                    # Compatibilidad: expresión antigua
+                    if 'map_expr' in config and config['map_expr']:
+                        map_expr = str(config['map_expr']).strip()
+                        if '=' in map_expr:
+                            new_col, expr = map_expr.split('=', 1)
+                            new_col = new_col.strip()
+                            expr = expr.strip()
+                            if '+' in expr:
+                                cols = [c.strip() for c in expr.split('+')]
+                                if len(cols) >= 2:
+                                    result_df = df.with_columns((pl.col(cols[0]) + pl.col(cols[1])).alias(new_col))
+                            elif '-' in expr:
+                                cols = [c.strip() for c in expr.split('-')]
+                                if len(cols) >= 2:
+                                    result_df = df.with_columns((pl.col(cols[0]) - pl.col(cols[1])).alias(new_col))
+                            elif '*' in expr:
+                                cols = [c.strip() for c in expr.split('*')]
+                                if len(cols) >= 2:
+                                    result_df = df.with_columns((pl.col(cols[0]) * pl.col(cols[1])).alias(new_col))
+                            elif '/' in expr:
+                                cols = [c.strip() for c in expr.split('/')]
+                                if len(cols) >= 2:
+                                    result_df = df.with_columns((pl.col(cols[0]) / pl.col(cols[1])).alias(new_col))
+                            else:
+                                self.execution_progress.emit(f"Expresión de mapeo no soportada en nodo {node_id}")
+                                result_df = df
                         else:
                             self.execution_progress.emit(f"Expresión de mapeo no soportada en nodo {node_id}")
                             result_df = df
                     else:
-                        self.execution_progress.emit(f"Expresión de mapeo no soportada en nodo {node_id}")
+                        self.execution_progress.emit(f"No se especificó expresión de mapeo para nodo {node_id}")
+                        result_df = df
+            elif subtype == 'cast':
+                # Casteo de tipos de datos
+                ops = config.get('cast_ops')
+                if isinstance(ops, list) and ops:
+                    try:
+                        def map_dtype(name: str):
+                            n = (name or '').strip().lower()
+                            if n == 'int64':
+                                return pl.Int64
+                            if n == 'int32':
+                                return pl.Int32
+                            if n == 'float64':
+                                return pl.Float64
+                            if n == 'float32':
+                                return pl.Float32
+                            if n in ('utf8', 'string', 'str', 'texto'):
+                                return pl.Utf8
+                            if n in ('bool', 'boolean'):
+                                return pl.Boolean
+                            if n == 'date':
+                                return pl.Date
+                            if n == 'datetime':
+                                return pl.Datetime
+                            return None
+                        exprs = []
+                        for op in ops:
+                            col = op.get('col')
+                            to = op.get('to')
+                            dtype = map_dtype(to)
+                            if col and dtype is not None and col in result_df.columns:
+                                exprs.append(pl.col(col).cast(dtype).alias(col))
+                        if exprs:
+                            result_df = result_df.with_columns(exprs)
+                    except Exception as e:
+                        self.execution_progress.emit(f"Error en casteo: {e}")
                         result_df = df
                 else:
-                    self.execution_progress.emit(f"No se especificó expresión de mapeo para nodo {node_id}")
+                    self.execution_progress.emit(f"No se especificaron operaciones de casteo para nodo {node_id}")
                     result_df = df
             else:
                 self.execution_progress.emit(f"Tipo de transformación desconocido para nodo {node_id}")
                 result_df = df
 
             # Post-procesamiento: selección y renombrado
+            # Nota: los nodos de unión realizan su propia selección/renombrado y ya retornaron.
             result_df = self._apply_select_and_rename(result_df, config)
+            try:
+                self.execution_progress.emit(f"Nodo {node_id} columnas: {list(result_df.columns)}")
+            except Exception:
+                pass
             return result_df
         except Exception as e:
             self.execution_progress.emit(f"Error en transformación nodo {node_id}: {e}")
@@ -356,16 +547,35 @@ class ETLEngine(QObject):
             self.execution_progress.emit(f"Escribiendo datos en base de datos tabla {table}...")
             pdf = df_to_write.to_pandas()
             try:
-                from sqlalchemy import create_engine
-                engine = create_engine(conn_str)
-                if_exists = (config.get('if_exists') or 'replace').lower()
-                pdf.to_sql(table, engine, if_exists=if_exists, index=False)
+                if (db_type or '').lower() == 'mysql':
+                    engine = self._make_sqlalchemy_engine(db_type, conn_str, config)
+                    if_exists = (config.get('if_exists') or 'replace').lower()
+                    pdf.to_sql(table, engine, if_exists=if_exists, index=False)
+                else:
+                    from sqlalchemy import create_engine
+                    engine = create_engine(conn_str)
+                    if_exists = (config.get('if_exists') or 'replace').lower()
+                    pdf.to_sql(table, engine, if_exists=if_exists, index=False)
                 self.execution_progress.emit(f"Datos escritos en la tabla {table}")
             except Exception as e:
-                self.execution_progress.emit(f"Error al escribir en base de datos: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
+                # Reintentar alternando SSL (solo MySQL)
+                if (db_type or '').lower() == 'mysql' and self._should_retry_ssl(e, config):
+                    try:
+                        retry_mode = 'DISABLED' if self._was_ssl_enabled(config) else 'REQUIRED'
+                        engine = self._make_sqlalchemy_engine(db_type, conn_str, config, ssl_mode_override=retry_mode)
+                        if_exists = (config.get('if_exists') or 'replace').lower()
+                        pdf.to_sql(table, engine, if_exists=if_exists, index=False)
+                        self.execution_progress.emit(f"Reintento MySQL con SSL='{retry_mode}' exitoso")
+                    except Exception as ie:
+                        self.execution_progress.emit(f"Error al escribir en base de datos: {ie}")
+                        import traceback
+                        traceback.print_exc()
+                        raise
+                else:
+                    self.execution_progress.emit(f"Error al escribir en base de datos: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
 
         elif subtype == 'api':
             # Envío de datos a API en JSON (por lotes si es grande)
@@ -458,9 +668,15 @@ class ETLEngine(QObject):
                         # Para simplificar, usamos solo el primer dataframe como entrada principal
                         input_df = input_dfs[0]
                         
-                        # Si es un nodo de unión y hay más de una entrada, guardar la segunda como "other_dataframe"
+                        # Si es un nodo de unión y hay más de una entrada, preparar lado derecho
                         config = self.pipeline.nodes[node_id]['config']
                         if config.get('subtype') == 'join' and len(input_dfs) > 1:
+                            # Respetar bandera de intercambio de entradas (swap_inputs)
+                            try:
+                                if bool(config.get('swap_inputs')):
+                                    input_df, input_dfs[1] = input_dfs[1], input_df
+                            except Exception:
+                                pass
                             config['other_dataframe'] = input_dfs[1]
                             
                         # Ejecutar transformación
@@ -532,6 +748,162 @@ class ETLEngine(QObject):
         except Exception:
             pass
         return result
+
+    def _execute_filter_rules(self, df: pl.DataFrame, rules: list, mode: str) -> pl.DataFrame:
+        """Aplica reglas de filtro estructuradas.
+        Cada regla: {column, op, value}
+        op en: '>', '<', '==', '!=', '>=', '<=', 'contains', 'in', 'isnull', 'notnull'
+        mode: 'all' (AND) o 'any' (OR)
+        """
+        exprs = []
+        for r in rules:
+            col = r.get('column')
+            op = str(r.get('op', '')).lower()
+            val = r.get('value')
+            if not col or not op:
+                continue
+            e = None
+            if op == '>':
+                e = pl.col(col) > val
+            elif op == '<':
+                e = pl.col(col) < val
+            elif op == '==':
+                e = pl.col(col) == val
+            elif op == '!=':
+                e = pl.col(col) != val
+            elif op == '>=':
+                e = pl.col(col) >= val
+            elif op == '<=':
+                e = pl.col(col) <= val
+            elif op == 'contains' and isinstance(val, str):
+                e = pl.col(col).cast(pl.Utf8).str.contains(val)
+            elif op == 'in':
+                try:
+                    seq = list(val) if not isinstance(val, list) else val
+                except Exception:
+                    seq = [val]
+                e = pl.col(col).is_in(seq)
+            elif op == 'isnull':
+                e = pl.col(col).is_null()
+            elif op == 'notnull':
+                e = pl.col(col).is_not_null()
+            if e is not None:
+                exprs.append(e)
+        if not exprs:
+            return df
+        final = exprs[0]
+        for e in exprs[1:]:
+            if mode == 'any':
+                final = final | e
+            else:
+                final = final & e
+        return df.filter(final)
+
+    def _execute_join(self, left_df: pl.DataFrame, config: Dict[str, Any]) -> pl.DataFrame:
+        """Ejecuta un join entre left_df y config['other_dataframe'] respetando join_cols/join_pairs,
+        tipo de join, sufijo derecho y aplica selección/renombrado con nombres calificados.
+        """
+        try:
+            right_df = config.get('other_dataframe')
+            if isinstance(right_df, pd.DataFrame):
+                right_df = pl.from_pandas(right_df)
+            if isinstance(left_df, pd.DataFrame):
+                left_df = pl.from_pandas(left_df)
+
+            join_type = (config.get('join_type', 'Inner') or 'Inner').lower()
+            right_suffix = str(config.get('right_suffix') or '_right')
+
+            # Soporte de pares (left:right) o un listado simple 'on'
+            left_on: List[str] = []
+            right_on: List[str] = []
+            join_pairs = str(config.get('join_pairs') or '').strip()
+            if join_pairs:
+                for p in [s for s in join_pairs.split(',') if s.strip()]:
+                    if ':' in p:
+                        l, r = p.split(':', 1)
+                        left_on.append(l.strip())
+                        right_on.append(r.strip())
+            if not left_on:
+                # Fallback a join_cols para ambos lados
+                base_cols = [c.strip() for c in str(config.get('join_cols') or '').split(',') if c.strip()]
+                left_on = base_cols
+                right_on = base_cols
+
+            # Ejecutar join
+            how = join_type if join_type in ('inner', 'left', 'right', 'outer') else 'inner'
+            result = left_df.join(right_df, left_on=left_on, right_on=right_on, how=how, suffix=right_suffix)
+
+            # Construir selección/renombrado respetando nombres calificados Origen1./Origen2.
+            left_cols = list(left_df.columns)
+            selections_full: List[str] = []
+            out_spec = config.get('output_cols')
+            if isinstance(out_spec, str) and out_spec.strip():
+                selections_full = [c.strip() for c in out_spec.split(',') if c.strip()]
+            rename_full: Dict[str, str] = {}
+            rn_spec = config.get('column_rename')
+            if isinstance(rn_spec, str) and rn_spec.strip():
+                for pair in rn_spec.split(','):
+                    if ':' in pair:
+                        k, v = pair.split(':', 1)
+                        rename_full[k.strip()] = v.strip()
+
+            def map_qualified_to_actual(qname: str) -> Optional[str]:
+                name = qname.strip()
+                src = None
+                base = name
+                if name.startswith('Origen1.'):
+                    src = 1
+                    base = name.split('.', 1)[1]
+                elif name.startswith('Origen2.'):
+                    src = 2
+                    base = name.split('.', 1)[1]
+                if src == 1:
+                    return base if base in result.columns else base
+                elif src == 2:
+                    if base in left_cols and base not in left_on:
+                        cand = f"{base}{right_suffix}"
+                        return cand if cand in result.columns else cand
+                    else:
+                        return base
+                else:
+                    return base
+
+            final_columns: List[str] = []
+            if selections_full:
+                for q in selections_full:
+                    actual = map_qualified_to_actual(q)
+                    if actual and actual not in final_columns:
+                        final_columns.append(actual)
+            else:
+                final_columns = list(result.columns)
+
+            rename_actual: Dict[str, str] = {}
+            for qkey, new_name in rename_full.items():
+                actual = map_qualified_to_actual(qkey)
+                if actual and new_name:
+                    rename_actual[actual] = new_name
+            for qkey, new_name in rename_full.items():
+                if '.' not in qkey and qkey in final_columns and qkey not in rename_actual:
+                    rename_actual[qkey] = new_name
+                elif '.' not in qkey and f"{qkey}{right_suffix}" in final_columns and f"{qkey}{right_suffix}" not in rename_actual:
+                    rename_actual[f"{qkey}{right_suffix}"] = new_name
+
+            if final_columns:
+                try:
+                    result = result.select([pl.col(c) for c in final_columns])
+                except Exception:
+                    pass
+            if rename_actual:
+                try:
+                    result = result.rename(rename_actual)
+                except Exception:
+                    pass
+            return result
+        except Exception as e:
+            self.execution_progress.emit(f"Error ejecutando join: {e}")
+            import traceback
+            traceback.print_exc()
+            return left_df
 
     def _apply_select_and_rename(self, df: pl.DataFrame, config: Dict[str, Any]) -> pl.DataFrame:
         """Aplica selección y renombrado de columnas según 'output_cols' y 'column_rename'."""
@@ -609,3 +981,59 @@ class ETLEngine(QObject):
             engine = create_engine(conn_str)
             pdf = pd.read_sql_query(query, engine)
             return pl.from_pandas(pdf)
+
+    def _make_sqlalchemy_engine(self, db_type: Optional[str], conn_str: str, config: Dict[str, Any], ssl_mode_override: Optional[str] = None):
+        """Crea un engine SQLAlchemy contemplando SSL/timeout para MySQL.
+        Config soportada en nodos DB (MySQL):
+          - ssl_mode: 'DISABLED' | 'REQUIRED' | 'VERIFY_CA' | 'VERIFY_IDENTITY'
+          - ssl_ca, ssl_cert, ssl_key, ssl_verify (bool)
+          - connect_timeout (segundos)
+        """
+        from sqlalchemy import create_engine
+        connect_args: Dict[str, Any] = {}
+        dbt = (db_type or '').lower()
+        if dbt == 'mysql':
+            # Timeout de conexión
+            try:
+                timeout = int(config.get('connect_timeout') or 10)
+                connect_args['connect_timeout'] = timeout
+            except Exception:
+                connect_args['connect_timeout'] = 10
+            # SSL
+            mode = (ssl_mode_override or config.get('ssl_mode') or '').strip().upper()
+            if mode in ('REQUIRED', 'VERIFY_CA', 'VERIFY_IDENTITY'):
+                import ssl as _ssl
+                ssl_dict: Dict[str, Any] = {}
+                ca = config.get('ssl_ca')
+                cert = config.get('ssl_cert')
+                key = config.get('ssl_key')
+                verify = str(config.get('ssl_verify') or '').strip().lower() in ('1', 'true', 'yes')
+                if not verify:
+                    ssl_dict['cert_reqs'] = _ssl.CERT_NONE
+                if ca:
+                    ssl_dict['ca'] = ca
+                if cert:
+                    ssl_dict['cert'] = cert
+                if key:
+                    ssl_dict['key'] = key
+                connect_args['ssl'] = ssl_dict
+        # Otros motores: sin cambios
+        return create_engine(conn_str, connect_args=connect_args, pool_pre_ping=True, pool_recycle=300)
+
+    def _was_ssl_enabled(self, config: Dict[str, Any]) -> bool:
+        mode = str(config.get('ssl_mode') or '').strip().upper()
+        return mode in ('REQUIRED', 'VERIFY_CA', 'VERIFY_IDENTITY')
+
+    def _should_retry_ssl(self, exc: Exception, config: Dict[str, Any]) -> bool:
+        """Heurística para alternar SSL en errores MySQL.
+        Retorna True si el mensaje sugiere problem de SSL o timeout (para probar el modo opuesto).
+        """
+        try:
+            msg = str(exc).lower()
+        except Exception:
+            return False
+        if any(k in msg for k in ['ssl', 'handshake', 'certificate', 'tls']):
+            return True
+        if 'timed out' in msg or 'timeout' in msg:
+            return True
+        return False

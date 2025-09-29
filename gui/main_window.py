@@ -336,6 +336,25 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Sin datos", "Los nodos conectados no contienen datos. Asegúrese de cargar datos en los nodos de origen.")
                 return
                 
+            # Si el propio nodo es una transformación de tipo filter/map/aggregate, aplicar preview
+            try:
+                st = (updated_config.get('subtype') or '').lower()
+                if st in ['filter', 'map', 'aggregate', 'cast'] and updated_config.get('dataframe') is not None:
+                    base_df = updated_config.get('dataframe')
+                    if st == 'filter':
+                        base_df = self.pipeline_canvas._apply_filter_rules_preview(base_df, updated_config)
+                    elif st == 'map':
+                        base_df = self.pipeline_canvas._apply_map_ops_preview(base_df, updated_config)
+                    elif st == 'aggregate':
+                        base_df = self.pipeline_canvas._apply_aggregate_preview(base_df, updated_config)
+                    elif st == 'cast':
+                        base_df = self.pipeline_canvas._apply_cast_preview(base_df, updated_config)
+                    # Aplicar selección/renombrado del propio nodo si existe
+                    preview_df = self.pipeline_canvas._apply_select_and_rename(base_df, updated_config)
+                    updated_config['dataframe'] = preview_df
+            except Exception as e:
+                self.log_message(f"Aviso: error construyendo preview de transformación: {e}")
+
             # Actualizar la configuración del nodo
             self.pipeline_canvas.graph.nodes[node_id]['config'] = updated_config
             
@@ -350,6 +369,19 @@ class MainWindow(QMainWindow):
                         QMessageBox.warning(self, "Datos incompletos", "Falta el primer origen de datos para la unión.")
                     elif 'other_dataframe' not in updated_config:
                         QMessageBox.warning(self, "Datos incompletos", "Falta el segundo origen de datos para la unión.")
+                else:
+                    # Si no hay selección definida, usar todas las columnas calificadas por defecto
+                    try:
+                        df1 = updated_config.get('dataframe')
+                        df2 = updated_config.get('other_dataframe')
+                        if df1 is not None and df2 is not None:
+                            if not updated_config.get('output_cols'):
+                                cols = []
+                                cols += [f"Origen1.{c}" for c in df1.columns]
+                                cols += [f"Origen2.{c}" for c in df2.columns]
+                                updated_config['output_cols'] = ','.join(cols)
+                    except Exception:
+                        pass
                     
             # Actualizar el panel de propiedades
             if hasattr(self.properties_panel, 'update_with_fetched_data'):
@@ -379,13 +411,25 @@ class MainWindow(QMainWindow):
             # Verificar si el nodo fuente tiene datos
             if 'dataframe' in source_config:
                 try:
-                    # Aplicar selección/renombrado del nodo fuente para la previsualización
-                    # Si la fuente es una UNIÓN y tiene ambos dataframes, construir combinado seleccionado
-                    if source_config.get('subtype') == 'join' and source_config.get('other_dataframe') is not None:
+                    # Construir preview según el tipo del nodo fuente
+                    st = (source_config.get('subtype') or '').lower()
+                    if st == 'join' and source_config.get('other_dataframe') is not None:
                         try:
                             preview_df = self.pipeline_canvas._build_join_selected_df(source_config)
                         except Exception:
                             preview_df = self._apply_select_and_rename_preview(source_config['dataframe'], source_config)
+                    elif st == 'filter':
+                        base_df = self.pipeline_canvas._apply_filter_rules_preview(source_config['dataframe'], source_config)
+                        preview_df = self.pipeline_canvas._apply_select_and_rename(base_df, source_config)
+                    elif st == 'map':
+                        base_df = self.pipeline_canvas._apply_map_ops_preview(source_config['dataframe'], source_config)
+                        preview_df = self.pipeline_canvas._apply_select_and_rename(base_df, source_config)
+                    elif st == 'aggregate':
+                        base_df = self.pipeline_canvas._apply_aggregate_preview(source_config['dataframe'], source_config)
+                        preview_df = self.pipeline_canvas._apply_select_and_rename(base_df, source_config)
+                    elif st == 'cast':
+                        base_df = self.pipeline_canvas._apply_cast_preview(source_config['dataframe'], source_config)
+                        preview_df = self.pipeline_canvas._apply_select_and_rename(base_df, source_config)
                     else:
                         preview_df = self._apply_select_and_rename_preview(source_config['dataframe'], source_config)
                 except Exception as e:
@@ -395,6 +439,12 @@ class MainWindow(QMainWindow):
                 # Actualizar la configuración del nodo destino con el dataframe de preview
                 updated_config = node_config.copy()
                 updated_config['dataframe'] = preview_df
+                # Si el destino no tiene selección definida, por defecto usar todas las columnas del preview
+                try:
+                    if not updated_config.get('output_cols'):
+                        updated_config['output_cols'] = ','.join(list(preview_df.columns))
+                except Exception:
+                    pass
 
                 # Guardar la configuración actualizada
                 self.pipeline_canvas.graph.nodes[node_id]['config'] = updated_config
@@ -439,6 +489,33 @@ class MainWindow(QMainWindow):
             return
         try:
             import json
+            # Asegurar que los cambios recientes en el panel actual se guarden
+            try:
+                if hasattr(self.properties_panel, 'current_node_id') and self.properties_panel.current_node_id is not None:
+                    n_id = self.properties_panel.current_node_id
+                    n_type = getattr(self.properties_panel, 'current_node_type', None)
+                    if n_type == 'transform':
+                        tt = getattr(self.properties_panel, 'current_transform_type', None)
+                        if tt:
+                            # Guardar configuración del transform (incluye Casteo y sus tablas)
+                            self.properties_panel.save_transform_config(n_id, tt)
+                    elif n_type == 'destination':
+                        dt = getattr(self.properties_panel, 'current_dest_type', None)
+                        if dt:
+                            # Guardar configuración de destino
+                            self.properties_panel.save_destination_config(n_id, dt)
+                    elif n_type == 'source':
+                        st = getattr(self.properties_panel, 'current_source_type', None)
+                        if st:
+                            # Guardar configuración de origen (silencioso si posible)
+                            # Evitar validaciones intrusivas; si falla, ignorar
+                            try:
+                                self.properties_panel.save_node_config(n_id, st)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
             data = {
                 'nodes': [],
                 'edges': [],
@@ -454,8 +531,10 @@ class MainWindow(QMainWindow):
                 else:
                     pos_dict = {'x': 0.0, 'y': 0.0}
 
-                # Configuración sin dataframes
-                config = node.get('config', {}).copy()
+                # Preferir configuración consolidada desde el panel de propiedades
+                config = (self.properties_panel.get_node_config(node_id) or {}).copy()
+                if not config:
+                    config = node.get('config', {}).copy()
                 config.pop('dataframe', None)
                 config.pop('other_dataframe', None)
 

@@ -206,6 +206,7 @@ class PipelineCanvas(QGraphicsView):
             'join': 'Unión',
             'aggregate': 'Agregación',
             'map': 'Mapeo',
+            'cast': 'Casteo',
         }
 
     def _format_node_name(self, node_type, subtype):
@@ -299,11 +300,32 @@ class PipelineCanvas(QGraphicsView):
                     return
                     
                 try:
-                    # Preparar dataframe aplicando selección/renombrado del origen (si corresponde)
-                    if source_config.get('subtype') == 'join' and source_config.get('other_dataframe') is not None:
-                        prepared_df = self._build_join_selected_df(source_config)
+                    # Preparar dataframe del ORIGEN aplicando la transformación si el origen es un nodo de transformación
+                    source_node_type = self.graph.nodes[source_id]['type'] if source_id in self.graph.nodes else None
+                    prepared_df = None
+                    if source_node_type == 'transform':
+                        st = source_config.get('subtype')
+                        if st == 'join' and source_config.get('other_dataframe') is not None:
+                            # El preview de unión ya respeta selección/renombre
+                            prepared_df = self._build_join_selected_df(source_config)
+                        else:
+                            # Aplicar transformación de preview y luego selección/renombrado
+                            base_df = source_config['dataframe']
+                            if st == 'filter':
+                                base_df = self._apply_filter_rules_preview(base_df, source_config)
+                            elif st == 'map':
+                                base_df = self._apply_map_ops_preview(base_df, source_config)
+                            elif st == 'aggregate':
+                                base_df = self._apply_aggregate_preview(base_df, source_config)
+                            elif st == 'cast':
+                                base_df = self._apply_cast_preview(base_df, source_config)
+                            prepared_df = self._apply_select_and_rename(base_df, source_config)
                     else:
-                        prepared_df = self._apply_select_and_rename(source_config['dataframe'], source_config)
+                        # Origen es un nodo de fuente o destino: solo aplicar selección/renombrado del origen
+                        if source_config.get('subtype') == 'join' and source_config.get('other_dataframe') is not None:
+                            prepared_df = self._build_join_selected_df(source_config)
+                        else:
+                            prepared_df = self._apply_select_and_rename(source_config['dataframe'], source_config)
                     # Si el destino es un nodo de transformación
                     if target_type == 'transform':
                         # Para nodos de unión, verificar si ya tiene un dataframe
@@ -395,6 +417,201 @@ class PipelineCanvas(QGraphicsView):
         except Exception:
             pass
         return df
+
+    def _to_pl(self, df):
+        """Convierte df a polars DataFrame si es posible."""
+        if isinstance(df, pl.DataFrame):
+            return df
+        try:
+            import pandas as pd
+            if isinstance(df, pd.DataFrame):
+                return pl.from_pandas(df)
+        except Exception:
+            pass
+        try:
+            return pl.DataFrame(df)
+        except Exception:
+            return pl.DataFrame()
+
+    def _apply_filter_rules_preview(self, df, config):
+        """Aplica reglas de filtro (preview) leyendo filter_rules/filter_mode."""
+        try:
+            df = self._to_pl(df)
+            rules = config.get('filter_rules')
+            mode = (config.get('filter_mode') or 'all').lower()
+            if not isinstance(rules, list) or not rules:
+                return df
+            exprs = []
+            for r in rules:
+                col = r.get('column')
+                op = str(r.get('op', '')).lower()
+                val = r.get('value')
+                if not col or not op:
+                    continue
+                e = None
+                if op == '>':
+                    e = pl.col(col) > val
+                elif op == '<':
+                    e = pl.col(col) < val
+                elif op == '==':
+                    e = pl.col(col) == val
+                elif op == '!=':
+                    e = pl.col(col) != val
+                elif op == '>=':
+                    e = pl.col(col) >= val
+                elif op == '<=':
+                    e = pl.col(col) <= val
+                elif op == 'contains' and isinstance(val, str):
+                    e = pl.col(col).cast(pl.Utf8).str.contains(val)
+                elif op == 'in':
+                    try:
+                        seq = list(val) if isinstance(val, (list, tuple, set)) else [v.strip() for v in str(val).split(',') if v.strip()]
+                    except Exception:
+                        seq = [val]
+                    e = pl.col(col).is_in(seq)
+                elif op == 'isnull':
+                    e = pl.col(col).is_null()
+                elif op == 'notnull':
+                    e = pl.col(col).is_not_null()
+                if e is not None:
+                    exprs.append(e)
+            if not exprs:
+                return df
+            final = exprs[0]
+            for e in exprs[1:]:
+                final = (final | e) if mode == 'any' else (final & e)
+            return df.filter(final)
+        except Exception:
+            return df
+
+    def _apply_map_ops_preview(self, df, config):
+        """Aplica operaciones de mapeo (preview) leyendo map_ops."""
+        try:
+            df = self._to_pl(df)
+            ops = config.get('map_ops')
+            if not isinstance(ops, list) or not ops:
+                return df
+            exprs = []
+            for op in ops:
+                new_col = op.get('new_col')
+                op_type = str(op.get('op_type', '')).lower()
+                a = op.get('a')
+                b = op.get('b')
+                val = op.get('value')
+                if not new_col:
+                    continue
+                expr = None
+                if op_type == 'add' and a and b:
+                    expr = (pl.col(a) + pl.col(b)).alias(new_col)
+                elif op_type == 'sub' and a and b:
+                    expr = (pl.col(a) - pl.col(b)).alias(new_col)
+                elif op_type == 'mul' and a and b:
+                    expr = (pl.col(a) * pl.col(b)).alias(new_col)
+                elif op_type == 'div' and a and b:
+                    expr = (pl.col(a) / pl.col(b)).alias(new_col)
+                elif op_type == 'concat' and a and b:
+                    expr = (pl.col(a).cast(pl.Utf8) + pl.col(b).cast(pl.Utf8)).alias(new_col)
+                elif op_type == 'literal' and val is not None:
+                    expr = pl.lit(val).alias(new_col)
+                elif op_type == 'copy' and a:
+                    expr = pl.col(a).alias(new_col)
+                elif op_type == 'upper' and a:
+                    expr = pl.col(a).cast(pl.Utf8).str.to_uppercase().alias(new_col)
+                elif op_type == 'lower' and a:
+                    expr = pl.col(a).cast(pl.Utf8).str.to_lowercase().alias(new_col)
+                elif op_type == 'length' and a:
+                    expr = pl.col(a).cast(pl.Utf8).str.len_chars().alias(new_col)
+                if expr is not None:
+                    exprs.append(expr)
+            return df.with_columns(exprs) if exprs else df
+        except Exception:
+            return df
+
+    def _apply_aggregate_preview(self, df, config):
+        """Aplica agregación (preview) leyendo group_by_list y aggs."""
+        try:
+            df = self._to_pl(df)
+            group_by = config.get('group_by_list')
+            aggs = config.get('aggs')
+            if not isinstance(group_by, list) or not isinstance(aggs, list):
+                return df
+            agg_exprs = []
+            for agg in aggs:
+                func = str(agg.get('func', '')).lower()
+                col = agg.get('col')
+                alias = agg.get('as') or None
+                if not col:
+                    continue
+                expr = None
+                if func == 'sum':
+                    expr = pl.sum(col)
+                elif func in ('avg', 'mean'):
+                    expr = pl.mean(col)
+                elif func == 'min':
+                    expr = pl.min(col)
+                elif func == 'max':
+                    expr = pl.max(col)
+                elif func == 'count':
+                    expr = pl.count()
+                if expr is not None and alias:
+                    expr = expr.alias(alias)
+                if expr is not None:
+                    agg_exprs.append(expr)
+            group_cols = [c for c in group_by if isinstance(c, str) and c]
+            if group_cols and agg_exprs:
+                return df.group_by(group_cols).agg(agg_exprs)
+            return df
+        except Exception:
+            return df
+
+    def _apply_cast_preview(self, df, config):
+        """Aplica casteo de tipos (preview) leyendo cast_ops."""
+        try:
+            df = self._to_pl(df)
+            ops = config.get('cast_ops')
+            if not isinstance(ops, list) or not ops:
+                return df
+            def map_dtype(name: str):
+                n = (name or '').strip().lower()
+                if n == 'int64':
+                    return pl.Int64
+                if n == 'int32':
+                    return pl.Int32
+                if n == 'float64':
+                    return pl.Float64
+                if n == 'float32':
+                    return pl.Float32
+                if n in ('utf8', 'string', 'str', 'texto'):
+                    return pl.Utf8
+                if n in ('bool', 'boolean'):
+                    return pl.Boolean
+                if n == 'date':
+                    return pl.Date
+                if n == 'datetime':
+                    return pl.Datetime
+                return None
+            exprs = []
+            for op in ops:
+                col = op.get('col')
+                to = op.get('to')
+                dtype = map_dtype(to)
+                if col and dtype is not None and col in df.columns:
+                    fmt = (op.get('fmt') or '').strip()
+                    if dtype == pl.Date:
+                        if fmt:
+                            exprs.append(pl.col(col).cast(pl.Utf8).str.strptime(pl.Date, fmt=fmt, strict=False).alias(col))
+                        else:
+                            exprs.append(pl.col(col).cast(pl.Utf8).str.to_date(strict=False).alias(col))
+                    elif dtype == pl.Datetime:
+                        if fmt:
+                            exprs.append(pl.col(col).cast(pl.Utf8).str.strptime(pl.Datetime, fmt=fmt, strict=False).alias(col))
+                        else:
+                            exprs.append(pl.col(col).cast(pl.Utf8).str.to_datetime(strict=False).alias(col))
+                    else:
+                        exprs.append(pl.col(col).cast(dtype).alias(col))
+            return df.with_columns(exprs) if exprs else df
+        except Exception:
+            return df
 
     def update_node_visual(self, node_id):
         """Actualiza el título y puntos de conexión del nodo tras cambio de subtipo."""
