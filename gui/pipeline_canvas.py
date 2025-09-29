@@ -4,6 +4,7 @@ from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsEllipseItem
 from PyQt6.QtCore import Qt, QPointF, pyqtSignal, QRectF, QLineF
 from PyQt6.QtGui import QPen, QBrush, QColor, QPainter, QPainterPath, QPolygonF
 import networkx as nx
+import polars as pl
 import math
 
 class ArrowItem(QGraphicsPathItem):
@@ -192,14 +193,56 @@ class PipelineCanvas(QGraphicsView):
             'Aggregate': 'Agregación',
             'Map': 'Mapeo'
         }
+
+        # Nombres visibles por subtipo (es-ES)
+        self.subtype_display_map = {
+            'csv': 'CSV',
+            'excel': 'Excel',
+            'json': 'JSON',
+            'parquet': 'Parquet',
+            'database': 'Base de Datos',
+            'api': 'API',
+            'filter': 'Filtro',
+            'join': 'Unión',
+            'aggregate': 'Agregación',
+            'map': 'Mapeo',
+        }
+
+    def _format_node_name(self, node_type, subtype):
+        node_name = self.node_type_names.get(node_type, node_type)
+        if subtype:
+            display = self.subtype_display_map.get(subtype, None)
+            if display is None:
+                try:
+                    display = subtype.capitalize()
+                except Exception:
+                    display = str(subtype)
+            node_name += f": {display}"
+        return node_name
         
     def add_node(self, node_type, position, subtype=None):
         """Add a new node to the pipeline"""
-        node_id = len(self.graph.nodes)
+        # Usar el siguiente ID disponible para evitar colisiones tras cargar pipelines
+        if self.graph.nodes:
+            try:
+                node_id = max(self.graph.nodes) + 1
+            except Exception:
+                node_id = len(self.graph.nodes)
+        else:
+            node_id = 0
         config = {'subtype': subtype} if subtype else {}
         self.graph.add_node(node_id, type=node_type, position=position, config=config)
         self.draw_node(node_id, position, subtype)
         return node_id
+    
+    def add_node_with_id(self, node_id, node_type, position, subtype=None):
+        """Add a node with an explicit ID (useful when loading a saved pipeline)."""
+        if node_id in self.graph.nodes:
+            # Avoid duplicates
+            return
+        config = {'subtype': subtype} if subtype else {}
+        self.graph.add_node(node_id, type=node_type, position=position, config=config)
+        self.draw_node(node_id, position, subtype)
         
     def add_connection(self, source_id, source_point, target_id, target_point):
         """Add a connection between nodes"""
@@ -256,31 +299,45 @@ class PipelineCanvas(QGraphicsView):
                     return
                     
                 try:
+                    # Preparar dataframe aplicando selección/renombrado del origen (si corresponde)
+                    if source_config.get('subtype') == 'join' and source_config.get('other_dataframe') is not None:
+                        prepared_df = self._build_join_selected_df(source_config)
+                    else:
+                        prepared_df = self._apply_select_and_rename(source_config['dataframe'], source_config)
                     # Si el destino es un nodo de transformación
                     if target_type == 'transform':
                         # Para nodos de unión, verificar si ya tiene un dataframe
                         if target_subtype == 'join':
-                            # Contar cuántas entradas ya tiene
+                            # Determinar la posición del source entre las entradas actuales
                             incoming = list(self.graph.in_edges(target_id))
-                            
-                            # Si es la primera conexión, guardar como dataframe principal
-                            if len(incoming) <= 1:
-                                # Asignar el dataframe directamente
-                                target_config['dataframe'] = source_config['dataframe']
-                                print(f"Datos copiados de {source_id} a {target_id} como dataframe principal")
-                            # Si es la segunda conexión, guardar como dataframe secundario
-                            elif len(incoming) == 2:
-                                # Asignar el dataframe directamente
-                                target_config['other_dataframe'] = source_config['dataframe']
-                                print(f"Datos copiados de {source_id} a {target_id} como dataframe secundario")
+                            pos = None
+                            for i, (src, _) in enumerate(incoming):
+                                if src == source_id:
+                                    pos = i
+                                    break
+                            if pos is None:
+                                # Fallback al conteo anterior
+                                if len(incoming) <= 1:
+                                    target_config['dataframe'] = prepared_df
+                                    print(f"Datos copiados de {source_id} a {target_id} como dataframe principal")
+                                else:
+                                    target_config['other_dataframe'] = prepared_df
+                                    print(f"Datos copiados de {source_id} a {target_id} como dataframe secundario")
+                            else:
+                                if pos == 0:
+                                    target_config['dataframe'] = prepared_df
+                                    print(f"Datos copiados de {source_id} a {target_id} como dataframe principal (pos 0)")
+                                else:
+                                    target_config['other_dataframe'] = prepared_df
+                                    print(f"Datos copiados de {source_id} a {target_id} como dataframe secundario (pos {pos})")
                         else:
                             # Para otros tipos de transformaciones, simplemente asignar el dataframe
-                            target_config['dataframe'] = source_config['dataframe']
+                            target_config['dataframe'] = prepared_df
                             print(f"Datos copiados de {source_id} a {target_id}")
                     # Si el destino es un nodo de destino
                     elif target_type == 'destination':
-                        # Asignar el dataframe directamente
-                        target_config['dataframe'] = source_config['dataframe']
+                        # Asignar el dataframe preparado
+                        target_config['dataframe'] = prepared_df
                         print(f"Datos copiados de {source_id} a {target_id} (destino)")
                 except Exception as e:
                     print(f"Error al copiar dataframe: {str(e)}")
@@ -293,6 +350,190 @@ class PipelineCanvas(QGraphicsView):
             print(f"Error en propagate_data_to_target: {str(e)}")
             import traceback
             traceback.print_exc()
+
+    def _apply_select_and_rename(self, df, config):
+        """Aplica la selección y renombrado definidos en el nodo origen."""
+        try:
+            # Asegurar Polars
+            if not isinstance(df, pl.DataFrame):
+                try:
+                    import pandas as pd
+                    if isinstance(df, pd.DataFrame):
+                        df = pl.from_pandas(df)
+                    else:
+                        df = pl.DataFrame(df)
+                except Exception:
+                    df = pl.DataFrame(df)
+
+            result = df
+            # Selección de columnas
+            output_cols = config.get('output_cols')
+            if output_cols and isinstance(output_cols, str):
+                cols = [c.strip() for c in output_cols.split(',') if c.strip()]
+                processed_cols = [c.split('.', 1)[1] if '.' in c else c for c in cols]
+                valid_cols = [c for c in processed_cols if c in result.columns]
+                if valid_cols:
+                    result = result.select(valid_cols)
+
+            # Renombrado de columnas
+            rename_spec = config.get('column_rename')
+            if rename_spec and isinstance(rename_spec, str):
+                rename_pairs = rename_spec.split(',')
+                rename_dict = {}
+                for pair in rename_pairs:
+                    if ':' in pair:
+                        old_name, new_name = pair.split(':', 1)
+                        old_name = old_name.strip()
+                        new_name = new_name.strip()
+                        if '.' in old_name:
+                            old_name = old_name.split('.', 1)[1]
+                        if old_name in result.columns and new_name:
+                            rename_dict[old_name] = new_name
+                if rename_dict:
+                    result = result.rename(rename_dict)
+            return result
+        except Exception:
+            pass
+        return df
+
+    def update_node_visual(self, node_id):
+        """Actualiza el título y puntos de conexión del nodo tras cambio de subtipo."""
+        try:
+            node_item = self.find_node_by_id(node_id)
+            if not node_item:
+                return
+            node_data = self.graph.nodes[node_id]
+            node_type = node_data['type']
+            config = node_data.get('config', {})
+            subtype = config.get('subtype')
+            # Actualizar subtipo
+            node_item.subtype = subtype
+
+            # Actualizar entradas/salidas según subtipo
+            if node_type == 'source':
+                node_item.num_inputs = 0
+                node_item.num_outputs = 1
+            elif node_type == 'transform':
+                if subtype in ['join', 'aggregate']:
+                    node_item.num_inputs = 2
+                else:
+                    node_item.num_inputs = 1
+                node_item.num_outputs = 1
+            elif node_type == 'destination':
+                node_item.num_inputs = 1
+                node_item.num_outputs = 0
+
+            # Eliminar puntos de conexión existentes (hijos) antes de recrearlos
+            for child in list(node_item.childItems()):
+                if isinstance(child, ConnectionPoint):
+                    # Quitar del parent y de la escena
+                    child.setParentItem(None)
+                    if self.scene:
+                        try:
+                            self.scene.removeItem(child)
+                        except Exception:
+                            pass
+
+            # Volver a crear puntos de conexión
+            node_item.setup_connection_points()
+
+            # Actualizar el texto del nodo (buscar el QGraphicsTextItem hijo)
+            node_name = self._format_node_name(node_type, subtype)
+            for child in node_item.childItems():
+                if isinstance(child, QGraphicsTextItem):
+                    child.setPlainText(node_name)
+                    break
+
+            # Actualizar flechas/conexiones visuales
+            self.update_node_connections(node_id)
+        except Exception as e:
+            print(f"Error actualizando visual del nodo {node_id}: {e}")
+
+    def _build_join_selected_df(self, config):
+        """Construye un dataframe combinado para un nodo de unión, respetando output_cols y renombres.
+        Si no hay selección, combina todas las columnas de Origen1 y Origen2.
+        """
+        try:
+            df1 = config.get('dataframe')
+            df2 = config.get('other_dataframe')
+            # Normalizar a Polars
+            def to_pl(df):
+                if isinstance(df, pl.DataFrame):
+                    return df
+                try:
+                    import pandas as pd
+                    if isinstance(df, pd.DataFrame):
+                        return pl.from_pandas(df)
+                except Exception:
+                    pass
+                return pl.DataFrame(df)
+            if df1 is not None:
+                df1 = to_pl(df1)
+            if df2 is not None:
+                df2 = to_pl(df2)
+
+            # Parse selección y renombres
+            selections = []
+            out_spec = config.get('output_cols')
+            if out_spec and isinstance(out_spec, str) and out_spec.strip():
+                selections = [c.strip() for c in out_spec.split(',') if c.strip()]
+            else:
+                # Por defecto: todas las columnas de ambos orígenes
+                if df1 is not None:
+                    selections.extend([f"Origen1.{c}" for c in df1.columns])
+                if df2 is not None:
+                    selections.extend([f"Origen2.{c}" for c in df2.columns])
+            rename_dict = {}
+            rn_spec = config.get('column_rename')
+            if rn_spec and isinstance(rn_spec, str):
+                for pair in rn_spec.split(','):
+                    if ':' in pair:
+                        old_name, new_name = pair.split(':', 1)
+                        rename_dict[old_name.strip()] = new_name.strip()
+
+            # Determinar número de filas para el preview combinado
+            n1 = len(df1) if df1 is not None else 0
+            n2 = len(df2) if df2 is not None else 0
+            n = max(n1, n2, 0)
+            # Evitar 0 filas para preview: usa min 1 (polars requiere longitud consistente)
+            if n == 0:
+                n = 0
+
+            data_cols = {}
+            for sel in selections:
+                base = sel
+                src = None
+                if sel.startswith('Origen1.'):
+                    src = 1
+                    base = sel.split('.', 1)[1]
+                elif sel.startswith('Origen2.'):
+                    src = 2
+                    base = sel.split('.', 1)[1]
+                # Nombre final (renombrado si aplica)
+                out_name = rename_dict.get(sel, base)
+                series = None
+                if src == 1 and df1 is not None and base in df1.columns:
+                    series = df1[base]
+                elif src == 2 and df2 is not None and base in df2.columns:
+                    series = df2[base]
+                # Rellenar o truncar a longitud n
+                if series is None:
+                    data_cols[out_name] = [None] * n
+                else:
+                    try:
+                        values = series.to_list()
+                    except Exception:
+                        values = list(series)
+                    if len(values) < n:
+                        values = values + [None] * (n - len(values))
+                    elif len(values) > n:
+                        values = values[:n]
+                    data_cols[out_name] = values
+            # Construir DataFrame
+            return pl.DataFrame(data_cols) if data_cols else (df1 if df1 is not None else df2)
+        except Exception as e:
+            print(f"Error construyendo preview de unión: {e}")
+            return config.get('dataframe')
         
     def draw_node(self, node_id, position, subtype=None):
         """Draw a node on the canvas"""
@@ -302,19 +543,13 @@ class PipelineCanvas(QGraphicsView):
         # Create node visual representation
         if node_type == 'source':
             color = QColor(100, 200, 100)  # Green for sources
-            node_name = self.node_type_names.get(node_type, node_type)
-            if subtype:
-                node_name += f": {subtype.capitalize()}"
+            node_name = self._format_node_name(node_type, subtype)
         elif node_type == 'transform':
             color = QColor(200, 200, 100)  # Yellow for transforms
-            node_name = self.node_type_names.get(node_type, node_type)
-            if subtype:
-                node_name += f": {subtype.capitalize()}"
+            node_name = self._format_node_name(node_type, subtype)
         elif node_type == 'destination':
             color = QColor(200, 100, 100)  # Red for destinations
-            node_name = self.node_type_names.get(node_type, node_type)
-            if subtype:
-                node_name += f": {subtype.capitalize()}"
+            node_name = self._format_node_name(node_type, subtype)
             
         # Create the node item
         node_item = NodeItem(position.x() - 40, position.y() - 40, 80, 80, 
@@ -345,6 +580,27 @@ class PipelineCanvas(QGraphicsView):
         # Guardar referencia a la flecha
         key = (source_id, target_id)
         self.arrows[key] = arrow
+    
+    def add_edge_simple(self, source_id, target_id):
+        """Add an edge between two nodes and draw a default arrow using available points."""
+        # Evitar conexiones duplicadas
+        if self.graph.has_edge(source_id, target_id):
+            return
+        self.graph.add_edge(source_id, target_id)
+        source_node = self.find_node_by_id(source_id)
+        target_node = self.find_node_by_id(target_id)
+        if not source_node or not target_node:
+            return
+        if not source_node.output_points or not target_node.input_points:
+            return
+        source_point = source_node.output_points[0]
+        # Determinar entrada a usar
+        input_idx = 0
+        if target_node.node_type == 'transform' and target_node.subtype in ['join', 'aggregate']:
+            incoming_count = len(list(self.graph.in_edges(target_id))) - 1  # ya añadimos este edge
+            input_idx = min(incoming_count, len(target_node.input_points) - 1)
+        target_point = target_node.input_points[input_idx]
+        self.draw_connection(source_id, source_point, target_id, target_point)
         
     def find_node_by_id(self, node_id):
         """Encuentra un nodo por su ID"""
@@ -611,6 +867,15 @@ class PipelineCanvas(QGraphicsView):
         node_item = self.find_node_by_id(node_id)
         if node_item:
             self.scene.removeItem(node_item)
+    
+    def clear_all(self):
+        """Clear the entire canvas, graph, and arrows."""
+        # Eliminar todos los items de la escena
+        for item in list(self.scene.items()):
+            self.scene.removeItem(item)
+        # Reiniciar estructuras
+        self.graph.clear()
+        self.arrows.clear()
             
     def wheelEvent(self, event):
         """Handle zooming with mouse wheel"""

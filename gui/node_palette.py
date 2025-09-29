@@ -33,6 +33,8 @@ class NodePalette(QWidget):
         source_buttons = [
             ("Archivo CSV", "source", "csv"),
             ("Archivo Excel", "source", "excel"),
+            ("Archivo JSON", "source", "json"),
+            ("Archivo Parquet", "source", "parquet"),
             ("Base de Datos", "source", "database"),
             ("API", "source", "api")
         ]
@@ -69,6 +71,8 @@ class NodePalette(QWidget):
         dest_buttons = [
             ("Archivo CSV", "destination", "csv"),
             ("Archivo Excel", "destination", "excel"),
+            ("Archivo JSON", "destination", "json"),
+            ("Archivo Parquet", "destination", "parquet"),
             ("Base de Datos", "destination", "database"),
             ("API", "destination", "api")
         ]

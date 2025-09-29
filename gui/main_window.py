@@ -1,11 +1,12 @@
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                             QPushButton, QLabel, QMenuBar, QMenu, QStatusBar,
-                            QTextEdit, QSplitter, QMessageBox)
-from PyQt6.QtCore import Qt, QTimer
+                            QTextEdit, QSplitter, QMessageBox, QFileDialog)
+from PyQt6.QtCore import Qt, QTimer, QPointF
 from .pipeline_canvas import PipelineCanvas
 from .node_palette import NodePalette
 from .properties_panel import PropertiesPanel
 from core.etl_engine import ETLEngine
+import polars as pl
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -93,11 +94,27 @@ class MainWindow(QMainWindow):
         
     def handle_node_config_changed(self, node_id, config):
         """Maneja el cambio de configuración de un nodo"""
+        # Evitar reentradas durante la reconstrucción del panel de propiedades
+        try:
+            if getattr(self.properties_panel, '_ui_rebuilding', False):
+                self.log_message("Ignorando cambio de configuración durante reconstrucción de UI")
+                return
+        except Exception:
+            pass
         # Actualizar la configuración del nodo en el pipeline
         if node_id in self.pipeline_canvas.graph.nodes:
+            # Detectar cambios de subtipo para actualizar el título/puertos
+            prev_config = self.pipeline_canvas.graph.nodes[node_id].get('config', {})
+            prev_subtype = prev_config.get('subtype')
             # Guardar la configuración actualizada
             self.pipeline_canvas.graph.nodes[node_id]['config'] = config
             self.log_message(f"Configuración actualizada para nodo {node_id}")
+            # Si cambió el subtipo, refrescar visual
+            try:
+                if prev_subtype != config.get('subtype'):
+                    self.pipeline_canvas.update_node_visual(node_id)
+            except Exception as e:
+                self.log_message(f"Aviso: no se pudo actualizar el título del nodo {node_id}: {e}")
             
             # Obtener tipo de nodo
             node_type = self.pipeline_canvas.graph.nodes[node_id]['type']
@@ -156,6 +173,54 @@ class MainWindow(QMainWindow):
         # Scroll to bottom
         scrollbar = self.log_panel.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def _apply_select_and_rename_preview(self, df, config):
+        """Aplica selección y renombrado de columnas para previsualización.
+        Respeta 'output_cols' y 'column_rename' del nodo fuente.
+        """
+        try:
+            # Asegurar Polars
+            if not isinstance(df, pl.DataFrame):
+                try:
+                    import pandas as pd
+                    if isinstance(df, pd.DataFrame):
+                        df = pl.from_pandas(df)
+                    else:
+                        df = pl.DataFrame(df)
+                except Exception:
+                    df = pl.DataFrame(df)
+
+            result = df
+            # Selección de columnas
+            output_cols = config.get('output_cols')
+            if output_cols and isinstance(output_cols, str):
+                cols = [c.strip() for c in output_cols.split(',') if c.strip()]
+                # Remover prefijos tipo OrigenX.
+                processed_cols = [c.split('.', 1)[1] if '.' in c else c for c in cols]
+                valid_cols = [c for c in processed_cols if c in result.columns]
+                if valid_cols:
+                    result = result.select(valid_cols)
+
+            # Renombrado de columnas
+            rename_spec = config.get('column_rename')
+            if rename_spec and isinstance(rename_spec, str):
+                rename_pairs = rename_spec.split(',')
+                rename_dict = {}
+                for pair in rename_pairs:
+                    if ':' in pair:
+                        old_name, new_name = pair.split(':', 1)
+                        old_name = old_name.strip()
+                        new_name = new_name.strip()
+                        if '.' in old_name:
+                            old_name = old_name.split('.', 1)[1]
+                        if old_name in result.columns and new_name:
+                            rename_dict[old_name] = new_name
+                if rename_dict:
+                    result = result.rename(rename_dict)
+            return result
+        except Exception as e:
+            self.log_message(f"Aviso: error aplicando selección/renombrado de preview: {e}")
+        return df
         
     def create_menu_bar(self):
         menubar = self.menuBar()
@@ -182,6 +247,9 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         run_pipeline_action.triggered.connect(self.run_pipeline)
         stop_pipeline_action.triggered.connect(self.stop_pipeline)
+        new_action.triggered.connect(self.new_pipeline)
+        open_action.triggered.connect(self.open_pipeline)
+        save_action.triggered.connect(self.save_pipeline)
         
     def run_pipeline(self):
         """Ejecuta la pipeline actual"""
@@ -208,8 +276,11 @@ class MainWindow(QMainWindow):
         """Detiene la ejecución de la pipeline"""
         self.statusBar().showMessage("Deteniendo pipeline...")
         self.log_message("Deteniendo ejecución de pipeline...")
-        # TODO: Implementar mecanismo para detener la ejecución
-        QMessageBox.information(self, "No implementado", "Detener pipeline no implementado aún")
+        try:
+            self.etl_engine.request_stop()
+            QMessageBox.information(self, "Detener", "Se solicitó detener la ejecución. Puede demorar unos segundos.")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"No fue posible solicitar detener: {e}")
         
     def fetch_data_from_connected_nodes(self, node_id):
         """Busca datos en los nodos conectados al nodo especificado"""
@@ -244,13 +315,18 @@ class MainWindow(QMainWindow):
                 # Verificar si el nodo fuente tiene datos
                 if 'dataframe' in source_config:
                     data_updated = True
+                    # Aplicar selección/renombrado definidos en el nodo fuente
+                    try:
+                        prepared_df = self._apply_select_and_rename_preview(source_config['dataframe'], source_config)
+                    except Exception:
+                        prepared_df = source_config['dataframe']
                     if idx == 0 or len(incoming_edges) == 1:
                         # Si es la primera entrada o la única, asignar como dataframe principal
-                        updated_config['dataframe'] = source_config['dataframe']
+                        updated_config['dataframe'] = prepared_df
                         self.log_message(f"Datos obtenidos del nodo {source_id} como fuente principal")
                     elif idx == 1 and node_config.get('subtype') in ['join', 'aggregate']:
                         # Si es la segunda entrada y el nodo es de unión o agregación
-                        updated_config['other_dataframe'] = source_config['dataframe']
+                        updated_config['other_dataframe'] = prepared_df
                         self.log_message(f"Datos obtenidos del nodo {source_id} como fuente secundaria")
                 else:
                     self.log_message(f"El nodo fuente {source_id} no tiene datos disponibles")
@@ -302,21 +378,33 @@ class MainWindow(QMainWindow):
             
             # Verificar si el nodo fuente tiene datos
             if 'dataframe' in source_config:
-                # Actualizar la configuración del nodo destino con los datos del nodo fuente
+                try:
+                    # Aplicar selección/renombrado del nodo fuente para la previsualización
+                    # Si la fuente es una UNIÓN y tiene ambos dataframes, construir combinado seleccionado
+                    if source_config.get('subtype') == 'join' and source_config.get('other_dataframe') is not None:
+                        try:
+                            preview_df = self.pipeline_canvas._build_join_selected_df(source_config)
+                        except Exception:
+                            preview_df = self._apply_select_and_rename_preview(source_config['dataframe'], source_config)
+                    else:
+                        preview_df = self._apply_select_and_rename_preview(source_config['dataframe'], source_config)
+                except Exception as e:
+                    self.log_message(f"Error aplicando selección/renombrado para preview: {e}")
+                    preview_df = source_config['dataframe']
+
+                # Actualizar la configuración del nodo destino con el dataframe de preview
                 updated_config = node_config.copy()
-                updated_config['dataframe'] = source_config['dataframe']
-                
+                updated_config['dataframe'] = preview_df
+
                 # Guardar la configuración actualizada
                 self.pipeline_canvas.graph.nodes[node_id]['config'] = updated_config
-                
-                # Actualizar el panel de propiedades
+
+                # Actualizar el panel de propiedades con el preview filtrado
                 if hasattr(self.properties_panel, 'set_node_dataframe'):
-                    self.properties_panel.set_node_dataframe(node_id, source_config['dataframe'])
-                    self.log_message(f"Dataframe actualizado para nodo destino {node_id}")
-                
-                # Asegurar que los datos se propaguen correctamente
-                self.pipeline_canvas.propagate_data_to_target(source_id, node_id)
-                
+                    self.properties_panel.set_node_dataframe(node_id, preview_df)
+                    self.log_message(f"Dataframe actualizado para nodo destino {node_id} (preview filtrado)")
+
+                # Nota: No llamamos a propagate_data_to_target aquí para no sobrescribir el preview
                 self.log_message(f"Datos obtenidos del nodo {source_id} para el nodo destino {node_id}")
             else:
                 self.log_message(f"El nodo fuente {source_id} no tiene datos disponibles")
@@ -325,3 +413,113 @@ class MainWindow(QMainWindow):
         else:
             self.log_message(f"El nodo {node_id} no es un nodo de transformación o destino")
             QMessageBox.warning(self, "Operación no válida", "Solo los nodos de transformación y destino pueden obtener datos de otros nodos") 
+
+    # --- Gestión de Archivos: Nuevo / Guardar / Abrir ---
+    def new_pipeline(self):
+        """Crea un pipeline nuevo (limpia el lienzo y estados)."""
+        resp = QMessageBox.question(
+            self,
+            "Nuevo Pipeline",
+            "Esto limpiará el pipeline actual. ¿Desea continuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if resp == QMessageBox.StandardButton.Yes:
+            self.pipeline_canvas.clear_all()
+            # Reiniciar propiedades
+            if hasattr(self.properties_panel, 'node_configs'):
+                self.properties_panel.node_configs.clear()
+            if hasattr(self.properties_panel, 'current_dataframes'):
+                self.properties_panel.current_dataframes.clear()
+            self.log_message("Nuevo pipeline creado.")
+
+    def save_pipeline(self):
+        """Guarda el pipeline a un archivo JSON (.etl.json)."""
+        path, _ = QFileDialog.getSaveFileName(self, "Guardar Pipeline", "", "ETL Pipeline (*.etl.json);;JSON (*.json)")
+        if not path:
+            return
+        try:
+            import json
+            data = {
+                'nodes': [],
+                'edges': [],
+            }
+            # Serializar nodos
+            for node_id in self.pipeline_canvas.graph.nodes:
+                node = self.pipeline_canvas.graph.nodes[node_id]
+                pos = node.get('position')
+                if isinstance(pos, QPointF):
+                    pos_dict = {'x': float(pos.x()), 'y': float(pos.y())}
+                elif isinstance(pos, (tuple, list)) and len(pos) == 2:
+                    pos_dict = {'x': float(pos[0]), 'y': float(pos[1])}
+                else:
+                    pos_dict = {'x': 0.0, 'y': 0.0}
+
+                # Configuración sin dataframes
+                config = node.get('config', {}).copy()
+                config.pop('dataframe', None)
+                config.pop('other_dataframe', None)
+
+                data['nodes'].append({
+                    'id': int(node_id),
+                    'type': node.get('type'),
+                    'position': pos_dict,
+                    'config': config,
+                })
+
+            # Serializar edges
+            for (src, dst) in self.pipeline_canvas.graph.edges:
+                data['edges'].append({'source': int(src), 'target': int(dst)})
+
+            # Escribir archivo
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.log_message(f"Pipeline guardado en {path}")
+            QMessageBox.information(self, "Guardado", "Pipeline guardado correctamente.")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Error al guardar pipeline: {e}")
+
+    def open_pipeline(self):
+        """Abre un pipeline desde archivo JSON (.etl.json)."""
+        path, _ = QFileDialog.getOpenFileName(self, "Abrir Pipeline", "", "ETL Pipeline (*.etl.json);;JSON (*.json)")
+        if not path:
+            return
+        try:
+            import json
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            # Limpiar actual
+            self.pipeline_canvas.clear_all()
+            if hasattr(self.properties_panel, 'node_configs'):
+                self.properties_panel.node_configs.clear()
+            if hasattr(self.properties_panel, 'current_dataframes'):
+                self.properties_panel.current_dataframes.clear()
+
+            # Crear nodos
+            for n in data.get('nodes', []):
+                nid = int(n['id'])
+                ntype = n['type']
+                cfg = n.get('config', {})
+                subtype = cfg.get('subtype')
+                pos_dict = n.get('position', {'x': 0.0, 'y': 0.0})
+                pos = QPointF(float(pos_dict.get('x', 0.0)), float(pos_dict.get('y', 0.0)))
+                self.pipeline_canvas.add_node_with_id(nid, ntype, pos, subtype)
+                # Establecer config cargada (sin dataframes)
+                self.pipeline_canvas.graph.nodes[nid]['config'] = cfg
+                # Sincronizar con panel de propiedades
+                self.properties_panel.node_configs[nid] = cfg
+
+            # Crear conexiones
+            for e in data.get('edges', []):
+                src = int(e['source'])
+                dst = int(e['target'])
+                self.pipeline_canvas.add_edge_simple(src, dst)
+
+            self.log_message(f"Pipeline cargado desde {path}")
+            QMessageBox.information(self, "Cargado", "Pipeline cargado correctamente.")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Error al abrir pipeline: {e}")

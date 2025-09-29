@@ -3,6 +3,9 @@ from typing import Dict, Any, List, Optional, Tuple
 import networkx as nx
 from PyQt6.QtCore import QObject, pyqtSignal
 import os
+import pandas as pd
+import json
+import requests
 
 class ETLEngine(QObject):
     # Señales
@@ -14,6 +17,7 @@ class ETLEngine(QObject):
         super().__init__()
         self.pipeline = nx.DiGraph()
         self.node_dataframes = {}  # Almacena los dataframes de cada nodo
+        self._stop_requested = False  # Bandera para detener ejecución
         
     def set_pipeline(self, pipeline: nx.DiGraph, node_configs: Dict[int, Dict[str, Any]]):
         """Establece el pipeline a partir del grafo visual y las configuraciones"""
@@ -41,107 +45,167 @@ class ETLEngine(QObject):
         self.pipeline.add_edge(source_id, target_id)
         
     def execute_source(self, node_id: int) -> pl.DataFrame:
-        """Execute a source node and return the resulting DataFrame"""
+        """Ejecuta un nodo de origen y retorna un DataFrame de Polars."""
         self.execution_progress.emit(f"Ejecutando nodo de origen {node_id}...")
-        
         config = self.pipeline.nodes[node_id]['config']
         subtype = config.get('subtype')
-        
-        # Si ya hay un dataframe en el nodo, usarlo
-        if 'dataframe' in config:
+
+        # Usar datos precargados si existen
+        if 'dataframe' in config and isinstance(config['dataframe'], (pl.DataFrame, pd.DataFrame)):
             self.execution_progress.emit(f"Usando datos precargados en nodo {node_id}")
-            return config['dataframe']
-        
-        # De lo contrario, cargar según el tipo
-        if subtype == 'csv':
-            if 'path' in config:
+            df = config['dataframe']
+            if isinstance(df, pd.DataFrame):
+                df = pl.from_pandas(df)
+            return self._apply_select_and_rename(df, config)
+
+        try:
+            if subtype == 'csv':
+                path = config.get('path')
+                if not path:
+                    raise ValueError(f"No se especificó ruta de archivo para el nodo {node_id}")
+                df = pl.read_csv(path)
+                return self._apply_select_and_rename(df, config)
+
+            elif subtype == 'excel':
+                path = config.get('path')
+                if not path:
+                    raise ValueError(f"No se especificó ruta de archivo para el nodo {node_id}")
+                # pl.read_excel puede no estar disponible en todas las versiones; fallback a pandas
                 try:
-                    df = pl.read_csv(config['path'])
-                    # Aplicar mapeo de columnas si existe
-                    if 'column_mapping' in config:
-                        column_map = config['column_mapping']
-                        if column_map:
-                            df = df.rename(column_map)
-                    return df
-                except Exception as e:
-                    self.execution_progress.emit(f"Error al cargar CSV: {e}")
-                    raise
+                    df = pl.read_excel(path)
+                except Exception:
+                    pdf = pd.read_excel(path)
+                    df = pl.from_pandas(pdf)
+                return self._apply_select_and_rename(df, config)
+
+            elif subtype == 'json':
+                path = config.get('path')
+                if not path:
+                    raise ValueError(f"No se especificó ruta de archivo para el nodo {node_id}")
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                # Detectar estructura
+                if isinstance(data, list):
+                    df = pl.DataFrame(data)
+                elif isinstance(data, dict):
+                    # Si tiene 'data' o similar, intentar usarlo
+                    key = 'data' if 'data' in data else None
+                    if key:
+                        df = pl.DataFrame(data[key])
+                    else:
+                        df = pl.DataFrame([data])
+                else:
+                    raise ValueError("Estructura JSON no soportada para conversión a DataFrame")
+                return self._apply_select_and_rename(df, config)
+
+            elif subtype == 'parquet':
+                path = config.get('path')
+                if not path:
+                    raise ValueError(f"No se especificó ruta de archivo para el nodo {node_id}")
+                df = pl.read_parquet(path)
+                return self._apply_select_and_rename(df, config)
+
+            elif subtype == 'database':
+                db_type = config.get('db_type')
+                host = config.get('host')
+                port = config.get('port')
+                user = config.get('user')
+                password = config.get('password')
+                database = config.get('database')
+                query = config.get('query')
+                if not query:
+                    raise ValueError("Debe especificar una consulta SQL en la configuración del nodo de base de datos")
+
+                conn_str = self._build_connection_string(db_type, host, port, user, password, database)
+                self.execution_progress.emit(f"Leyendo desde base de datos ({db_type})...")
+                df = self._read_sql(conn_str, query)
+                return self._apply_select_and_rename(df, config)
+
+            elif subtype == 'api':
+                url = config.get('url')
+                method = (config.get('method') or 'GET').upper()
+                headers = self._parse_kv_string(config.get('headers')) if isinstance(config.get('headers'), str) else config.get('headers')
+                params = self._parse_kv_string(config.get('params')) if isinstance(config.get('params'), str) else config.get('params')
+                if not url:
+                    raise ValueError("Debe especificar una URL para el origen API")
+                self.execution_progress.emit(f"Llamando API {method} {url}...")
+                resp = requests.request(method, url, headers=headers, params=params, timeout=60)
+                resp.raise_for_status()
+                try:
+                    data = resp.json()
+                except Exception:
+                    # Intentar CSV si el contenido lo parece
+                    try:
+                        from io import BytesIO
+                        df = pl.read_csv(BytesIO(resp.content))
+                        return self._apply_select_and_rename(df, config)
+                    except Exception:
+                        raise ValueError("La respuesta de la API no es JSON ni CSV soportado")
+                # Normalizar JSON
+                if isinstance(data, list):
+                    df = pl.DataFrame(data)
+                elif isinstance(data, dict):
+                    key = 'data' if 'data' in data else None
+                    if key:
+                        df = pl.DataFrame(data[key])
+                    else:
+                        df = pl.DataFrame([data])
+                else:
+                    raise ValueError("Estructura de respuesta de API no soportada")
+                return self._apply_select_and_rename(df, config)
+
             else:
-                self.execution_progress.emit(f"Nodo {node_id}: No se especificó ruta de archivo")
-                raise ValueError(f"No se especificó ruta de archivo para el nodo {node_id}")
-                
-        elif subtype == 'database':
-            # TODO: Implementar conexión a base de datos
-            self.execution_progress.emit(f"Conexión a base de datos no implementada para nodo {node_id}")
-            raise NotImplementedError("Conexión a base de datos no implementada")
-            
-        elif subtype == 'api':
-            # TODO: Implementar conexión a API
-            self.execution_progress.emit(f"Conexión a API no implementada para nodo {node_id}")
-            raise NotImplementedError("Conexión a API no implementada")
-            
-        self.execution_progress.emit(f"Tipo de origen desconocido para nodo {node_id}")
-        raise ValueError(f"Tipo de origen desconocido para nodo {node_id}")
+                raise ValueError(f"Tipo de origen desconocido o no soportado para nodo {node_id}")
+        except Exception as e:
+            self.execution_progress.emit(f"Error al ejecutar origen {node_id}: {e}")
+            raise
         
     def execute_transform(self, node_id: int, df: pl.DataFrame) -> pl.DataFrame:
-        """Execute a transform node on the input DataFrame"""
+        """Ejecuta un nodo de transformación sobre el DataFrame de entrada."""
         self.execution_progress.emit(f"Ejecutando transformación en nodo {node_id}...")
-        
         config = self.pipeline.nodes[node_id]['config']
         subtype = config.get('subtype')
-        
-        # Ejecutar transformación según el tipo
-        if subtype == 'filter':
-            filter_expr = config.get('filter_expr')
-            if filter_expr:
-                # Convertir expresión de texto a expresión de Polars
-                try:
-                    # Creamos una expresión simple para filtrar
-                    # Ejemplo: "col('edad') > 25" 
+
+        result_df = df
+        try:
+            if subtype == 'filter':
+                filter_expr = config.get('filter_expr')
+                if filter_expr:
                     expr_str = filter_expr.strip()
-                    
-                    # Evaluar la expresión (esto es simplificado, en producción sería más robusto)
                     if '>' in expr_str:
                         col, val = expr_str.split('>')
                         col = col.strip()
                         val = float(val.strip())
-                        return df.filter(pl.col(col) > val)
+                        result_df = df.filter(pl.col(col) > val)
                     elif '<' in expr_str:
                         col, val = expr_str.split('<')
                         col = col.strip()
                         val = float(val.strip())
-                        return df.filter(pl.col(col) < val)
+                        result_df = df.filter(pl.col(col) < val)
                     elif '==' in expr_str:
                         col, val = expr_str.split('==')
                         col = col.strip()
                         val = val.strip()
-                        # Intentar convertir a número si es posible
                         try:
                             val = float(val)
-                            return df.filter(pl.col(col) == val)
-                        except:
-                            # Es un string
-                            return df.filter(pl.col(col) == val)
+                            result_df = df.filter(pl.col(col) == val)
+                        except Exception:
+                            result_df = df.filter(pl.col(col) == val)
                     else:
                         self.execution_progress.emit(f"Expresión de filtro no soportada: {expr_str}")
-                        return df
-                except Exception as e:
-                    self.execution_progress.emit(f"Error al aplicar filtro: {e}")
-                    return df
-            else:
-                self.execution_progress.emit(f"No se especificó expresión de filtro para nodo {node_id}")
-                return df
-                
-        elif subtype == 'join':
-            # Para simplificar, asumimos que ya existen los datos de ambos lados en el nodo
-            # En una implementación completa, habría que obtener los datos del otro nodo
-            if 'join_cols' in config and 'other_dataframe' in config:
-                join_cols = [col.strip() for col in config['join_cols'].split(',')]
-                other_df = config['other_dataframe']
-                join_type = config.get('join_type', 'Inner').lower()
-                
-                try:
-                    # Realizar la unión según el tipo especificado
+                        result_df = df
+                else:
+                    self.execution_progress.emit(f"No se especificó expresión de filtro para nodo {node_id}")
+                    result_df = df
+
+            elif subtype == 'join':
+                if 'join_cols' in config and 'other_dataframe' in config:
+                    join_cols = [col.strip() for col in str(config['join_cols']).split(',') if col.strip()]
+                    other_df = config['other_dataframe']
+                    if isinstance(other_df, pd.DataFrame):
+                        other_df = pl.from_pandas(other_df)
+                    join_type = (config.get('join_type', 'Inner') or 'Inner').lower()
+
                     if join_type == 'inner':
                         result_df = df.join(other_df, on=join_cols, how='inner')
                     elif join_type == 'left':
@@ -151,223 +215,183 @@ class ETLEngine(QObject):
                     elif join_type == 'outer':
                         result_df = df.join(other_df, on=join_cols, how='outer')
                     else:
-                        # Por defecto, inner join
                         result_df = df.join(other_df, on=join_cols, how='inner')
-                    
-                    # Aplicar selección de columnas de salida si está especificado
-                    if 'output_cols' in config and config['output_cols'].strip():
-                        output_cols = [col.strip() for col in config['output_cols'].split(',')]
-                        
-                        # Procesar los nombres de columnas que pueden tener prefijos de origen
-                        processed_cols = []
-                        for col in output_cols:
-                            # Si el nombre tiene formato "OrigenX.nombre_columna", extraer solo el nombre
-                            if col.startswith("Origen1.") or col.startswith("Origen2."):
-                                col_name = col.split(".", 1)[1]
-                                processed_cols.append(col_name)
-                            else:
-                                processed_cols.append(col)
-                        
-                        # Verificar que todas las columnas existen
-                        valid_cols = [col for col in processed_cols if col in result_df.columns]
-                        if valid_cols:
-                            self.execution_progress.emit(f"Seleccionando columnas de salida: {', '.join(valid_cols)}")
-                            result_df = result_df.select(valid_cols)
-                        else:
-                            self.execution_progress.emit(f"Ninguna columna válida encontrada en la selección")
-                    
-                    # Aplicar renombrado de columnas si está especificado
-                    if 'column_rename' in config and config['column_rename'].strip():
-                        rename_pairs = config['column_rename'].split(',')
-                        rename_dict = {}
-                        
-                        for pair in rename_pairs:
-                            if ':' in pair:
-                                old_name, new_name = pair.split(':', 1)
-                                old_name = old_name.strip()
-                                new_name = new_name.strip()
-                                
-                                # Procesar nombres con prefijos de origen
-                                if old_name.startswith("Origen1.") or old_name.startswith("Origen2."):
-                                    old_name = old_name.split(".", 1)[1]
-                                
-                                if old_name in result_df.columns:
-                                    rename_dict[old_name] = new_name
-                        
-                        if rename_dict:
-                            self.execution_progress.emit(f"Renombrando columnas: {rename_dict}")
-                            result_df = result_df.rename(rename_dict)
-                    
-                    return result_df
-                except Exception as e:
-                    self.execution_progress.emit(f"Error al realizar join: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    return df
-            else:
-                self.execution_progress.emit(f"Faltan parámetros para realizar join en nodo {node_id}")
-                return df
-                
-        elif subtype == 'aggregate':
-            # Implementación simplificada de agregación
-            if 'group_by' in config and 'agg_funcs' in config:
-                try:
-                    group_cols = [col.strip() for col in config['group_by'].split(',')]
-                    
-                    # Parsear expresiones de agregación (simplificado)
+                else:
+                    self.execution_progress.emit(f"Faltan parámetros para realizar join en nodo {node_id}")
+                    result_df = df
+
+            elif subtype == 'aggregate':
+                if 'group_by' in config and 'agg_funcs' in config:
+                    group_cols = [col.strip() for col in str(config['group_by']).split(',') if col.strip()]
                     agg_exprs = []
-                    for agg_expr in config['agg_funcs'].split(','):
+                    for agg_expr in str(config['agg_funcs']).split(','):
                         if '(' in agg_expr and ')' in agg_expr:
                             func, col = agg_expr.strip().split('(')
                             col = col.replace(')', '').strip()
-                            
                             if func.lower() == 'sum':
                                 agg_exprs.append(pl.sum(col))
-                            elif func.lower() == 'avg' or func.lower() == 'mean':
+                            elif func.lower() in ('avg', 'mean'):
                                 agg_exprs.append(pl.mean(col))
                             elif func.lower() == 'min':
                                 agg_exprs.append(pl.min(col))
                             elif func.lower() == 'max':
                                 agg_exprs.append(pl.max(col))
                             elif func.lower() == 'count':
-                                agg_exprs.append(pl.count(col))
-                    
+                                agg_exprs.append(pl.count())
                     if group_cols and agg_exprs:
-                        return df.group_by(group_cols).agg(agg_exprs)
+                        result_df = df.group_by(group_cols).agg(agg_exprs)
                     else:
                         self.execution_progress.emit(f"Expresiones de agregación inválidas en nodo {node_id}")
-                        return df
-                except Exception as e:
-                    self.execution_progress.emit(f"Error al realizar agregación: {e}")
-                    return df
-            else:
-                self.execution_progress.emit(f"Faltan parámetros para agregación en nodo {node_id}")
-                return df
-                
-        elif subtype == 'map':
-            # Implementación simplificada de mapeo/columnas calculadas
-            if 'map_expr' in config:
-                map_expr = config['map_expr'].strip()
-                try:
-                    # Detectar formato "nueva_col = operación"
+                        result_df = df
+                else:
+                    self.execution_progress.emit(f"Faltan parámetros para agregación en nodo {node_id}")
+                    result_df = df
+
+            elif subtype == 'map':
+                if 'map_expr' in config and config['map_expr']:
+                    map_expr = str(config['map_expr']).strip()
                     if '=' in map_expr:
                         new_col, expr = map_expr.split('=', 1)
                         new_col = new_col.strip()
                         expr = expr.strip()
-                        
-                        # Detectar operaciones aritméticas simples
                         if '+' in expr:
                             cols = [c.strip() for c in expr.split('+')]
-                            # Implementación simplificada: sumamos las primeras dos columnas
                             if len(cols) >= 2:
-                                return df.with_columns(
-                                    (pl.col(cols[0]) + pl.col(cols[1])).alias(new_col)
-                                )
+                                result_df = df.with_columns((pl.col(cols[0]) + pl.col(cols[1])).alias(new_col))
                         elif '-' in expr:
                             cols = [c.strip() for c in expr.split('-')]
                             if len(cols) >= 2:
-                                return df.with_columns(
-                                    (pl.col(cols[0]) - pl.col(cols[1])).alias(new_col)
-                                )
+                                result_df = df.with_columns((pl.col(cols[0]) - pl.col(cols[1])).alias(new_col))
                         elif '*' in expr:
                             cols = [c.strip() for c in expr.split('*')]
                             if len(cols) >= 2:
-                                return df.with_columns(
-                                    (pl.col(cols[0]) * pl.col(cols[1])).alias(new_col)
-                                )
+                                result_df = df.with_columns((pl.col(cols[0]) * pl.col(cols[1])).alias(new_col))
                         elif '/' in expr:
                             cols = [c.strip() for c in expr.split('/')]
                             if len(cols) >= 2:
-                                return df.with_columns(
-                                    (pl.col(cols[0]) / pl.col(cols[1])).alias(new_col)
-                                )
-                    
-                    self.execution_progress.emit(f"Expresión de mapeo no soportada en nodo {node_id}")
-                    return df
-                except Exception as e:
-                    self.execution_progress.emit(f"Error al aplicar mapeo: {e}")
-                    return df
+                                result_df = df.with_columns((pl.col(cols[0]) / pl.col(cols[1])).alias(new_col))
+                        else:
+                            self.execution_progress.emit(f"Expresión de mapeo no soportada en nodo {node_id}")
+                            result_df = df
+                    else:
+                        self.execution_progress.emit(f"Expresión de mapeo no soportada en nodo {node_id}")
+                        result_df = df
+                else:
+                    self.execution_progress.emit(f"No se especificó expresión de mapeo para nodo {node_id}")
+                    result_df = df
             else:
-                self.execution_progress.emit(f"No se especificó expresión de mapeo para nodo {node_id}")
-                return df
-                
-        self.execution_progress.emit(f"Tipo de transformación desconocido para nodo {node_id}")
-        return df
+                self.execution_progress.emit(f"Tipo de transformación desconocido para nodo {node_id}")
+                result_df = df
+
+            # Post-procesamiento: selección y renombrado
+            result_df = self._apply_select_and_rename(result_df, config)
+            return result_df
+        except Exception as e:
+            self.execution_progress.emit(f"Error en transformación nodo {node_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            return df
         
     def execute_destination(self, node_id: int, df: pl.DataFrame):
-        """Execute a destination node to save the DataFrame"""
+        """Ejecuta un nodo de destino para guardar o enviar el DataFrame."""
         self.execution_progress.emit(f"Ejecutando nodo de destino {node_id}...")
-        
         config = self.pipeline.nodes[node_id]['config']
         subtype = config.get('subtype')
-        
-        # Guardar según el tipo de destino
-        if subtype == 'csv':
-            if 'path' in config and config['path']:
-                try:
-                    path = config['path']
-                    # Verificar que la ruta no es un directorio
-                    if os.path.isdir(path):
-                        self.execution_progress.emit(f"Error: La ruta especificada es un directorio: {path}")
-                        raise ValueError(f"La ruta especificada es un directorio: {path}")
-                        
-                    format_type = config.get('format', 'CSV').lower()
-                    
-                    # Asegurarse de que el directorio existe
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    
-                    self.execution_progress.emit(f"Guardando datos en {path}...")
-                    
-                    if format_type == 'csv':
-                        df.write_csv(path)
-                    elif format_type == 'excel':
-                        df.write_excel(path)
-                    elif format_type == 'parquet':
-                        df.write_parquet(path)
-                    elif format_type == 'json':
-                        df.write_json(path)
-                    else:
-                        # Por defecto, CSV
-                        df.write_csv(path)
-                        
-                    self.execution_progress.emit(f"Datos guardados en {path}")
-                except Exception as e:
-                    self.execution_progress.emit(f"Error al guardar datos: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    raise
-            else:
+
+        # Post-procesamiento opcional en destino (selección/renombrado)
+        df_to_write = self._apply_select_and_rename(df, config)
+
+        if subtype in ('csv', 'excel', 'json', 'parquet'):
+            path = config.get('path')
+            if not path:
                 self.execution_progress.emit(f"No se especificó ruta de destino para nodo {node_id}")
                 raise ValueError(f"No se especificó ruta de destino para nodo {node_id}")
-        # SOPORTE PARA DESTINO EXCEL
-        elif subtype == 'excel':
-            if 'path' in config and config['path']:
-                try:
-                    path = config['path']
-                    if os.path.isdir(path):
-                        self.execution_progress.emit(f"Error: La ruta especificada es un directorio: {path}")
-                        raise ValueError(f"La ruta especificada es un directorio: {path}")
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    self.execution_progress.emit(f"Guardando datos en {path}...")
-                    df.write_excel(path)
-                    self.execution_progress.emit(f"Datos guardados en {path}")
-                except Exception as e:
-                    self.execution_progress.emit(f"Error al guardar datos: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    raise
-            else:
-                self.execution_progress.emit(f"No se especificó ruta de destino para nodo {node_id}")
-                raise ValueError(f"No se especificó ruta de destino para nodo {node_id}")
-                
+            try:
+                if os.path.isdir(path):
+                    raise ValueError(f"La ruta especificada es un directorio: {path}")
+                out_dir = os.path.dirname(path)
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+
+                # Determinar formato: si hay 'format' úsalo, si no, según subtipo
+                default_fmt = 'excel' if subtype == 'excel' else ('json' if subtype == 'json' else ('parquet' if subtype == 'parquet' else 'csv'))
+                format_type = (config.get('format') or default_fmt).lower()
+                self.execution_progress.emit(f"Guardando datos en {path} como {format_type.upper()}...")
+
+                if format_type == 'csv':
+                    df_to_write.write_csv(path)
+                elif format_type == 'parquet':
+                    df_to_write.write_parquet(path)
+                elif format_type == 'json':
+                    df_to_write.write_json(path)
+                elif format_type == 'excel':
+                    # Polars no tiene write_excel estable: usar pandas
+                    pdf = df_to_write.to_pandas()
+                    try:
+                        pdf.to_excel(path, index=False)
+                    except Exception as e:
+                        raise ValueError(f"Error escribiendo Excel: {e}")
+                else:
+                    df_to_write.write_csv(path)
+
+                self.execution_progress.emit(f"Datos guardados en {path}")
+            except Exception as e:
+                self.execution_progress.emit(f"Error al guardar datos: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+
         elif subtype == 'database':
-            # TODO: Implementar escritura a base de datos
-            self.execution_progress.emit(f"Escritura a base de datos no implementada para nodo {node_id}")
-            
+            # Escritura a base de datos con pandas + sqlalchemy
+            db_type = config.get('db_type')
+            host = config.get('host')
+            port = config.get('port')
+            user = config.get('user')
+            password = config.get('password')
+            database = config.get('database')
+            table = config.get('table')
+            if not table:
+                raise ValueError("Debe especificar el nombre de la tabla de destino ('table')")
+            conn_str = self._build_connection_string(db_type, host, port, user, password, database)
+            self.execution_progress.emit(f"Escribiendo datos en base de datos tabla {table}...")
+            pdf = df_to_write.to_pandas()
+            try:
+                from sqlalchemy import create_engine
+                engine = create_engine(conn_str)
+                if_exists = (config.get('if_exists') or 'replace').lower()
+                pdf.to_sql(table, engine, if_exists=if_exists, index=False)
+                self.execution_progress.emit(f"Datos escritos en la tabla {table}")
+            except Exception as e:
+                self.execution_progress.emit(f"Error al escribir en base de datos: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+
         elif subtype == 'api':
-            # TODO: Implementar envío a API
-            self.execution_progress.emit(f"Envío a API no implementada para nodo {node_id}")
-            
+            # Envío de datos a API en JSON (por lotes si es grande)
+            url = config.get('url')
+            method = (config.get('method') or 'POST').upper()
+            headers = self._parse_kv_string(config.get('headers')) if isinstance(config.get('headers'), str) else config.get('headers')
+            params = self._parse_kv_string(config.get('params')) if isinstance(config.get('params'), str) else config.get('params')
+            if not url:
+                raise ValueError("Debe especificar la URL para el destino API")
+            self.execution_progress.emit(f"Enviando datos a API {method} {url}...")
+            data_records = df_to_write.to_dicts()
+            batch_size = int(config.get('batch_size') or 500)
+            try:
+                for i in range(0, len(data_records), batch_size):
+                    if self._stop_requested:
+                        raise KeyboardInterrupt("Ejecución detenida por el usuario")
+                    batch = data_records[i:i+batch_size]
+                    resp = requests.request(method, url, headers=headers, params=params, json=batch, timeout=60)
+                    if not resp.ok:
+                        raise ValueError(f"Error de API (status {resp.status_code}): {resp.text}")
+                    self.execution_progress.emit(f"Lote {i//batch_size + 1} enviado ({len(batch)} registros)")
+                self.execution_progress.emit("Envío a API completado")
+            except Exception as e:
+                self.execution_progress.emit(f"Error al enviar a API: {e}")
+                raise
+
         else:
             self.execution_progress.emit(f"Tipo de destino desconocido para nodo {node_id}")
             
@@ -375,6 +399,7 @@ class ETLEngine(QObject):
         """Execute the entire pipeline"""
         try:
             self.execution_progress.emit("Iniciando ejecución del pipeline...")
+            self._stop_requested = False
             
             # Validar pipeline
             if not nx.is_directed_acyclic_graph(self.pipeline):
@@ -406,6 +431,10 @@ class ETLEngine(QObject):
             # Execute pipeline
             node_results = {}
             for node_id in sorted_nodes:
+                if self._stop_requested:
+                    self.execution_progress.emit("Ejecución detenida por el usuario")
+                    self.execution_finished.emit(False, "Ejecución detenida por el usuario")
+                    return False
                 node_type = self.pipeline.nodes[node_id]['type']
                 
                 try:
@@ -480,4 +509,103 @@ class ETLEngine(QObject):
             import traceback
             traceback.print_exc()
             self.execution_finished.emit(False, f"Error al ejecutar pipeline: {str(e)}")
-            return False 
+            return False
+
+    # Utilidades
+    def request_stop(self):
+        """Solicita detener la ejecución del pipeline lo más pronto posible."""
+        self._stop_requested = True
+
+    def _parse_kv_string(self, s: Optional[str]) -> Optional[Dict[str, str]]:
+        """Convierte un string tipo 'k1:v1,k2:v2' en dict. Ignora entradas malformadas."""
+        if s is None:
+            return None
+        if isinstance(s, dict):
+            return s  # ya es dict
+        result: Dict[str, str] = {}
+        try:
+            pairs = [p for p in str(s).split(',') if p.strip()]
+            for p in pairs:
+                if ':' in p:
+                    k, v = p.split(':', 1)
+                    result[k.strip()] = v.strip()
+        except Exception:
+            pass
+        return result
+
+    def _apply_select_and_rename(self, df: pl.DataFrame, config: Dict[str, Any]) -> pl.DataFrame:
+        """Aplica selección y renombrado de columnas según 'output_cols' y 'column_rename'."""
+        result = df
+        try:
+            # Selección de columnas
+            output_cols = config.get('output_cols')
+            if output_cols and isinstance(output_cols, str):
+                cols = [c.strip() for c in output_cols.split(',') if c.strip()]
+                # Remover prefijos tipo OrigenX.
+                processed_cols = [c.split('.', 1)[1] if '.' in c else c for c in cols]
+                valid_cols = [c for c in processed_cols if c in result.columns]
+                if valid_cols:
+                    result = result.select(valid_cols)
+
+            # Renombrado de columnas
+            rename_spec = config.get('column_rename')
+            if rename_spec and isinstance(rename_spec, str):
+                rename_pairs = rename_spec.split(',')
+                rename_dict = {}
+                for pair in rename_pairs:
+                    if ':' in pair:
+                        old_name, new_name = pair.split(':', 1)
+                        old_name = old_name.strip()
+                        new_name = new_name.strip()
+                        if '.' in old_name:
+                            old_name = old_name.split('.', 1)[1]
+                        if old_name in result.columns and new_name:
+                            rename_dict[old_name] = new_name
+                if rename_dict:
+                    result = result.rename(rename_dict)
+        except Exception as e:
+            self.execution_progress.emit(f"Aviso: error aplicando selección/renombrado: {e}")
+        return result
+
+    def _build_connection_string(self, db_type: Optional[str], host: Optional[str], port: Optional[str], user: Optional[str], password: Optional[str], database: Optional[str]) -> str:
+        db_type = (db_type or '').lower()
+        if db_type == 'sqlite':
+            # Para SQLite el 'host' se usa como path del archivo si viene en 'database'
+            if database and (database.endswith('.db') or database.endswith('.sqlite3')):
+                return f"sqlite:///{database}"
+            elif host and (host.endswith('.db') or host.endswith('.sqlite3')):
+                return f"sqlite:///{host}"
+            else:
+                raise ValueError("Para SQLite especifique el path del archivo en 'database' o 'host'")
+        elif db_type in ('postgresql', 'postgres'):
+            return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}"
+        elif db_type == 'mysql':
+            return f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+        elif db_type in ('mssql', 'sql server', 'sqlserver'):
+            # Requiere mssql+pyodbc con DSN apropiado; se asume driver por defecto
+            return f"mssql+pyodbc://{user}:{password}@{host}:{port}/{database}?driver=ODBC+Driver+17+for+SQL+Server"
+        else:
+            raise ValueError(f"Tipo de base de datos no soportado: {db_type}")
+
+    def _read_sql(self, conn_str: str, query: str) -> pl.DataFrame:
+        """Lee datos SQL intentando con connectorx y haciendo fallback a pandas+sqlalchemy."""
+        try:
+            import connectorx as cx
+            pdf = cx.read_sql(conn_str, query)
+            # connectorx puede devolver pandas DataFrame
+            if isinstance(pdf, pd.DataFrame):
+                return pl.from_pandas(pdf)
+            # Si devuelve un PyArrow Table
+            try:
+                import pyarrow as pa
+                if isinstance(pdf, pa.Table):
+                    return pl.from_arrow(pdf)
+            except Exception:
+                pass
+            # Intentar crear polars directamente si fuese soportado
+            return pl.DataFrame(pdf)
+        except Exception:
+            from sqlalchemy import create_engine
+            engine = create_engine(conn_str)
+            pdf = pd.read_sql_query(query, engine)
+            return pl.from_pandas(pdf)
