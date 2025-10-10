@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QPushButton, 
                             QFileDialog, QTableWidget, QTableWidgetItem,
                             QComboBox, QLineEdit, QFormLayout, QGroupBox,
-                            QHBoxLayout, QMessageBox, QTabWidget)
+                            QHBoxLayout, QMessageBox, QTabWidget, QCheckBox)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 import polars as pl
 import pandas as pd
@@ -114,8 +114,31 @@ class PropertiesPanel(QWidget):
         # Inicializar la configuración si no existe
         if node_id not in self.node_configs:
             self.node_configs[node_id] = node_data.copy() if isinstance(node_data, dict) else {}
+        else:
+            # Fusionar datos nuevos con configuración existente, preservando dataframes
+            existing_config = self.node_configs[node_id]
+            for key, value in node_data.items():
+                if key not in ['dataframe', 'other_dataframe']:  # Preservar dataframes existentes
+                    existing_config[key] = value
+                elif key in ['dataframe', 'other_dataframe'] and key not in existing_config:
+                    # Solo agregar dataframes si no existen ya
+                    existing_config[key] = value
+        
+        # Asegurar que el subtype está presente
+        if 'subtype' not in self.node_configs[node_id] and 'subtype' in node_data:
+            self.node_configs[node_id]['subtype'] = node_data['subtype']
+        
+        # Si es un nodo de origen sin subtype, establecer por defecto
+        if node_type == 'source' and not self.node_configs[node_id].get('subtype'):
+            if 'subtype' in node_data:
+                self.node_configs[node_id]['subtype'] = node_data['subtype']
+            else:
+                self.node_configs[node_id]['subtype'] = 'database'  # Por defecto
+        
+        # Emitir cambio inmediatamente para asegurar propagación
+        self.node_config_changed.emit(node_id, self.node_configs[node_id])
             
-        # Usar la configuración guardada
+        # Usar la configuración guardada (que incluye dataframes preservados)
         self.current_node_data = self.node_configs[node_id]
             
         if node_type == 'source':
@@ -472,17 +495,136 @@ class PropertiesPanel(QWidget):
                 join_type.setCurrentText(node_data['join_type'])
             join_config_layout.addRow("Tipo de unión:", join_type)
             
-            # Columnas de unión
-            join_cols = QLineEdit()
-            join_cols.setText(node_data.get('join_cols', ''))
-            join_cols.setPlaceholderText("columna1,columna2")
-            join_config_layout.addRow("Columnas de unión:", join_cols)
-
-            # Pares de claves (izquierda:derecha) opcional
-            join_pairs = QLineEdit()
-            join_pairs.setText(node_data.get('join_pairs', ''))
-            join_pairs.setPlaceholderText("col_izq:col_der,col2_izq:col2_der")
-            join_config_layout.addRow("Pares de claves (opcional):", join_pairs)
+            # Obtener columnas disponibles de los dataframes conectados
+            left_columns = []
+            right_columns = []
+            if 'dataframe' in node_data:
+                left_columns = list(node_data['dataframe'].columns)
+            if 'other_dataframe' in node_data:
+                right_columns = list(node_data['other_dataframe'].columns)
+            
+            # Columnas comunes (para unión simple)
+            common_columns = list(set(left_columns) & set(right_columns))
+            
+            if common_columns:
+                # Selector de columnas comunes
+                join_cols_widget = QWidget()
+                join_cols_layout = QVBoxLayout(join_cols_widget)
+                join_cols_layout.setContentsMargins(0, 0, 0, 0)
+                
+                join_cols_label = QLabel("Columnas comunes para unión:")
+                join_cols_layout.addWidget(join_cols_label)
+                
+                # Crear checkboxes para cada columna común
+                self.join_common_checkboxes = []
+                existing_join_cols = node_data.get('join_cols', '').split(',') if node_data.get('join_cols') else []
+                existing_join_cols = [col.strip() for col in existing_join_cols if col.strip()]
+                
+                for col in common_columns:
+                    checkbox = QCheckBox(col)
+                    if col in existing_join_cols:
+                        checkbox.setChecked(True)
+                    checkbox.stateChanged.connect(lambda *_: self._schedule_autosave('transform', node_id))
+                    join_cols_layout.addWidget(checkbox)
+                    self.join_common_checkboxes.append(checkbox)
+                
+                join_config_layout.addRow(join_cols_widget)
+            else:
+                # Si no hay columnas comunes, mostrar mensaje
+                no_common_label = QLabel("No hay columnas comunes detectadas")
+                no_common_label.setStyleSheet("color: orange; font-style: italic;")
+                join_config_layout.addRow("Columnas comunes:", no_common_label)
+                self.join_common_checkboxes = []
+            
+            # Tabla de pares personalizados (izquierda:derecha)
+            pairs_group = QGroupBox("Pares de claves personalizados")
+            pairs_layout = QVBoxLayout()
+            
+            # Tabla para pares de columnas
+            pairs_table = QTableWidget()
+            pairs_table.setColumnCount(2)
+            pairs_table.setHorizontalHeaderLabels(["Columna Izquierda", "Columna Derecha"])
+            pairs_table.horizontalHeader().setStretchLastSection(True)
+            
+            # Cargar pares existentes
+            existing_pairs = []
+            if 'join_pairs' in node_data and node_data['join_pairs']:
+                for pair in node_data['join_pairs'].split(','):
+                    if ':' in pair:
+                        left_col, right_col = pair.split(':', 1)
+                        existing_pairs.append((left_col.strip(), right_col.strip()))
+            
+            # Si no hay pares existentes, agregar una fila vacía
+            if not existing_pairs:
+                existing_pairs = [('', '')]
+            
+            pairs_table.setRowCount(len(existing_pairs))
+            self.join_pairs_combos = []
+            
+            for i, (left_col, right_col) in enumerate(existing_pairs):
+                # Columna izquierda
+                left_combo = QComboBox()
+                left_combo.addItem("")  # Opción vacía
+                left_combo.addItems(left_columns)
+                if left_col in left_columns:
+                    left_combo.setCurrentText(left_col)
+                left_combo.currentTextChanged.connect(lambda *_: self._schedule_autosave('transform', node_id))
+                pairs_table.setCellWidget(i, 0, left_combo)
+                
+                # Columna derecha
+                right_combo = QComboBox()
+                right_combo.addItem("")  # Opción vacía
+                right_combo.addItems(right_columns)
+                if right_col in right_columns:
+                    right_combo.setCurrentText(right_col)
+                right_combo.currentTextChanged.connect(lambda *_: self._schedule_autosave('transform', node_id))
+                pairs_table.setCellWidget(i, 1, right_combo)
+                
+                self.join_pairs_combos.append((left_combo, right_combo))
+            
+            pairs_layout.addWidget(pairs_table)
+            
+            # Botones para agregar/quitar filas
+            pairs_buttons = QHBoxLayout()
+            add_pair_btn = QPushButton("+ Agregar par")
+            remove_pair_btn = QPushButton("- Quitar par")
+            
+            def add_pair():
+                row = pairs_table.rowCount()
+                pairs_table.insertRow(row)
+                
+                left_combo = QComboBox()
+                left_combo.addItem("")
+                left_combo.addItems(left_columns)
+                left_combo.currentTextChanged.connect(lambda *_: self._schedule_autosave('transform', node_id))
+                pairs_table.setCellWidget(row, 0, left_combo)
+                
+                right_combo = QComboBox()
+                right_combo.addItem("")
+                right_combo.addItems(right_columns)
+                right_combo.currentTextChanged.connect(lambda *_: self._schedule_autosave('transform', node_id))
+                pairs_table.setCellWidget(row, 1, right_combo)
+                
+                self.join_pairs_combos.append((left_combo, right_combo))
+            
+            def remove_pair():
+                current_row = pairs_table.currentRow()
+                if current_row >= 0 and pairs_table.rowCount() > 1:
+                    pairs_table.removeRow(current_row)
+                    if current_row < len(self.join_pairs_combos):
+                        self.join_pairs_combos.pop(current_row)
+                    self._schedule_autosave('transform', node_id)
+            
+            add_pair_btn.clicked.connect(add_pair)
+            remove_pair_btn.clicked.connect(remove_pair)
+            
+            pairs_buttons.addWidget(add_pair_btn)
+            pairs_buttons.addWidget(remove_pair_btn)
+            pairs_buttons.addStretch()
+            
+            pairs_layout.addLayout(pairs_buttons)
+            pairs_group.setLayout(pairs_layout)
+            join_config_layout.addRow(pairs_group)
 
             # Sufijo para columnas de la derecha
             right_suffix = QLineEdit()
@@ -501,8 +643,6 @@ class PropertiesPanel(QWidget):
             transform_layout.addRow(join_config_group)
             # Auto-guardado de campos de unión
             join_type.currentTextChanged.connect(lambda *_: self._schedule_autosave('transform', node_id))
-            join_cols.editingFinished.connect(lambda: self._schedule_autosave('transform', node_id))
-            join_pairs.editingFinished.connect(lambda: self._schedule_autosave('transform', node_id))
             right_suffix.editingFinished.connect(lambda: self._schedule_autosave('transform', node_id))
             
             # SECCIÓN 2: VISUALIZACIÓN DE DATOS DE ENTRADA
@@ -550,7 +690,7 @@ class PropertiesPanel(QWidget):
                 
             # Extraer selección y renombrado guardados (usar nombres calificados Origen1./Origen2.)
             selected_full = []
-            renamed_full = {}
+            renamed_cols = {}
             if 'output_cols' in node_data and node_data['output_cols']:
                 selected_full = [col.strip() for col in node_data['output_cols'].split(',') if col.strip()]
             if 'column_rename' in node_data and node_data['column_rename']:
@@ -558,7 +698,7 @@ class PropertiesPanel(QWidget):
                 for pair in rename_pairs:
                     if ':' in pair:
                         old_name, new_name = pair.split(':', 1)
-                        renamed_full[old_name.strip()] = new_name.strip()
+                        renamed_cols[old_name.strip()] = new_name.strip()
             
             # Llenar la tabla con todas las columnas disponibles
             column_table.setRowCount(len(all_columns))
@@ -580,8 +720,8 @@ class PropertiesPanel(QWidget):
                 
                 # Columna 3: Campo para renombrar
                 rename_field = QLineEdit()
-                if col_name in renamed_full:
-                    rename_field.setText(renamed_full[col_name])
+                if base_col in renamed_cols:
+                    rename_field.setText(renamed_cols[col_name])
                 else:
                     rename_field.setPlaceholderText(base_col)
                 column_table.setCellWidget(i, 2, rename_field)
@@ -626,8 +766,6 @@ class PropertiesPanel(QWidget):
             # Guardar referencias para usar al guardar
             self.join_fields = {
                 'join_type': join_type,
-                'join_cols': join_cols,
-                'join_pairs': join_pairs,
                 'right_suffix': right_suffix,
                 'column_table': column_table
             }
@@ -1600,12 +1738,32 @@ class PropertiesPanel(QWidget):
         elif transform_type == "Unión":
             config['subtype'] = 'join'
             if hasattr(self, 'join_fields'):
-                # Guardar tipo de unión y columnas de unión
+                # Guardar tipo de unión
                 config['join_type'] = self.join_fields['join_type'].currentText()
-                config['join_cols'] = self.join_fields['join_cols'].text()
-                # Guardar pares y sufijo derecha
-                if 'join_pairs' in self.join_fields:
-                    config['join_pairs'] = self.join_fields['join_pairs'].text()
+                
+                # Guardar columnas comunes seleccionadas
+                if hasattr(self, 'join_common_checkboxes'):
+                    selected_common = []
+                    for checkbox in self.join_common_checkboxes:
+                        if checkbox.isChecked():
+                            selected_common.append(checkbox.text())
+                    config['join_cols'] = ','.join(selected_common)
+                else:
+                    config['join_cols'] = ''
+                
+                # Guardar pares personalizados
+                if hasattr(self, 'join_pairs_combos'):
+                    pairs = []
+                    for left_combo, right_combo in self.join_pairs_combos:
+                        left_col = left_combo.currentText().strip()
+                        right_col = right_combo.currentText().strip()
+                        if left_col and right_col:
+                            pairs.append(f"{left_col}:{right_col}")
+                    config['join_pairs'] = ','.join(pairs)
+                else:
+                    config['join_pairs'] = ''
+                
+                # Guardar sufijo derecha
                 if 'right_suffix' in self.join_fields:
                     config['right_suffix'] = self.join_fields['right_suffix'].text() or '_right'
                 
@@ -2170,30 +2328,43 @@ class PropertiesPanel(QWidget):
             node_type = self.current_node_type
             subtype = config.get('subtype')
             
-            # Guardar la configuración actualizada en el nodo
-            self.node_configs[node_id] = config
+            # Fusionar la configuración actualizada preservando datos existentes
+            if node_id not in self.node_configs:
+                self.node_configs[node_id] = {}
+            
+            # Preservar configuraciones importantes existentes
+            existing_config = self.node_configs[node_id]
+            preserved_keys = ['dataframe', 'other_dataframe', 'path', 'custom_name']
+            preserved_data = {key: existing_config[key] for key in preserved_keys if key in existing_config}
+            
+            # Actualizar con nueva configuración
+            self.node_configs[node_id].update(config)
+            
+            # Restaurar datos preservados
+            self.node_configs[node_id].update(preserved_data)
             
             # Reconstruir completamente el panel de propiedades para el nodo
-            self.show_node_properties(node_id, node_type, config)
+            self.show_node_properties(node_id, node_type, self.node_configs[node_id])
             
             # Llenar la tabla de selección de columnas si es un nodo de unión
             if node_type == 'transform' and subtype == 'join':
                 # Asegurarse de que las columnas se muestren en la tabla de selección
                 all_columns = []
-                if 'dataframe' in config:
-                    df1 = config['dataframe']
+                final_config = self.node_configs[node_id]
+                if 'dataframe' in final_config:
+                    df1 = final_config['dataframe']
                     all_columns.extend([f"Origen1.{col}" for col in df1.columns])
-                if 'other_dataframe' in config:
-                    df2 = config['other_dataframe']
+                if 'other_dataframe' in final_config:
+                    df2 = final_config['other_dataframe']
                     all_columns.extend([f"Origen2.{col}" for col in df2.columns])
 
                 # Parsear selección/renombrado existente
                 selected_cols = []
                 renamed_cols = {}
-                if 'output_cols' in config and config['output_cols']:
-                    selected_cols = [c.strip().split('.', 1)[-1] for c in config['output_cols'].split(',') if c.strip()]
-                if 'column_rename' in config and config['column_rename']:
-                    for pair in config['column_rename'].split(','):
+                if 'output_cols' in final_config and final_config['output_cols']:
+                    selected_cols = [c.strip().split('.', 1)[-1] for c in final_config['output_cols'].split(',') if c.strip()]
+                if 'column_rename' in final_config and final_config['column_rename']:
+                    for pair in final_config['column_rename'].split(','):
                         if ':' in pair:
                             old_name, new_name = pair.split(':', 1)
                             renamed_cols[old_name.strip().split('.', 1)[-1]] = new_name.strip()
@@ -2216,7 +2387,7 @@ class PropertiesPanel(QWidget):
                         base_col = col_name.split('.', 1)[-1]
                         # Columna 1: Checkbox
                         checkbox = QTableWidgetItem()
-                        is_selected = True if not selected_full else (col_name in selected_full)
+                        is_selected = True if not selected_cols else (base_col in selected_cols)
                         checkbox.setCheckState(Qt.CheckState.Checked if is_selected else Qt.CheckState.Unchecked)
                         column_table.setItem(i, 0, checkbox)
                         self.column_checkboxes.append(checkbox)
@@ -2227,8 +2398,8 @@ class PropertiesPanel(QWidget):
 
                         # Columna 3: Renombrar
                         rename_field = QLineEdit()
-                        if col_name in renamed_full:
-                            rename_field.setText(renamed_full[col_name])
+                        if base_col in renamed_cols:
+                            rename_field.setText(renamed_cols[base_col])
                         else:
                             rename_field.setPlaceholderText(base_col)
                         column_table.setCellWidget(i, 2, rename_field)

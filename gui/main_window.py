@@ -1,6 +1,9 @@
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                             QPushButton, QLabel, QMenuBar, QMenu, QStatusBar,
-                            QTextEdit, QSplitter, QMessageBox, QFileDialog)
+                            QTextEdit, QSplitter, QMessageBox, QFileDialog,
+                            QToolButton, QDialog, QDialogButtonBox, QTableWidget,
+                            QTableWidgetItem, QAbstractItemView, QFormLayout,
+                            QTabWidget)
 from PyQt6.QtCore import Qt, QTimer, QPointF
 from .pipeline_canvas import PipelineCanvas
 from .node_palette import NodePalette
@@ -65,6 +68,15 @@ class MainWindow(QMainWindow):
         self.properties_panel.node_config_changed.connect(self.handle_node_config_changed)
         self.pipeline_canvas.connection_created.connect(self.log_message)
         self.properties_panel.fetch_connected_data.connect(self.fetch_data_from_connected_nodes)
+        # Reaplicar botones laterales de expandir cuando cambie la configuración y se reconstruya el panel
+        self.properties_panel.node_config_changed.connect(lambda *_: QTimer.singleShot(0, self._add_side_expand_buttons))
+        # Clear properties panel when clicking on canvas background
+        if hasattr(self.pipeline_canvas, 'background_clicked'):
+            self.pipeline_canvas.background_clicked.connect(self.clear_properties_panel)
+        # Añadir botones laterales tras seleccionar nodo
+        self.pipeline_canvas.node_selected.connect(lambda *_: QTimer.singleShot(0, self._add_side_expand_buttons))
+        # Recordar último nodo seleccionado para abrir dataframes correctos
+        self.pipeline_canvas.node_selected.connect(self._remember_last_selected_node)
         
         # Connect ETL engine signals
         self.etl_engine.execution_progress.connect(self.log_message)
@@ -159,6 +171,8 @@ class MainWindow(QMainWindow):
         # Actualizar el dataframe en el panel de propiedades
         self.properties_panel.set_node_dataframe(node_id, dataframe)
         self.log_message(f"Nodo {node_id} ejecutado con éxito - {len(dataframe)} filas")
+        # Asegurar que los botones laterales estén presentes
+        QTimer.singleShot(0, self._add_side_expand_buttons)
         
     def handle_execution_finished(self, success, message):
         """Maneja el final de la ejecución del pipeline"""
@@ -173,6 +187,463 @@ class MainWindow(QMainWindow):
         # Scroll to bottom
         scrollbar = self.log_panel.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def clear_properties_panel(self):
+        """Limpia el panel de propiedades y muestra un mensaje vacío."""
+        panel = self.properties_panel
+        # Log para verificar conexión con clic de fondo
+        try:
+            self.log_message("Fondo clicado: limpiando panel de propiedades")
+        except Exception:
+            pass
+        # Prevenir reconstrucciones mientras limpiamos (autosave, timers)
+        try:
+            setattr(panel, '_ui_rebuilding', True)
+            if hasattr(panel, '_autosave_timer') and panel._autosave_timer.isActive():
+                panel._autosave_timer.stop()
+            setattr(panel, '_pending_autosave', None)
+        except Exception:
+            pass
+        # Limpiar overlays
+        if hasattr(self, '_overlay_buttons'):
+            try:
+                for tbl, btn in list(self._overlay_buttons.items()):
+                    try:
+                        btn.hide()
+                        btn.setParent(None)
+                    except Exception:
+                        pass
+                self._overlay_buttons.clear()
+            except Exception:
+                pass
+        # Desconectar señales del panel actual
+        try:
+            self.pipeline_canvas.node_selected.disconnect(self.properties_panel.show_node_properties)
+        except Exception:
+            pass
+        try:
+            self.properties_panel.node_config_changed.disconnect(self.handle_node_config_changed)
+        except Exception:
+            pass
+        try:
+            self.properties_panel.fetch_connected_data.disconnect(self.fetch_data_from_connected_nodes)
+        except Exception:
+            pass
+        # Remover el panel actual del layout superior y destruir su parent
+        try:
+            top_layout = self.top_widget.layout()
+        except Exception:
+            top_layout = None
+        try:
+            if top_layout is not None:
+                top_layout.removeWidget(self.properties_panel)
+        except Exception:
+            pass
+        try:
+            self.properties_panel.setParent(None)
+        except Exception:
+            pass
+        # Crear un nuevo panel vacío y volver a conectar señales
+        new_panel = PropertiesPanel()
+        self.properties_panel = new_panel
+        try:
+            if top_layout is not None:
+                top_layout.addWidget(new_panel)
+        except Exception:
+            pass
+        # Reconectar señales
+        self.pipeline_canvas.node_selected.connect(self.properties_panel.show_node_properties)
+        self.properties_panel.node_config_changed.connect(self.handle_node_config_changed)
+        self.properties_panel.fetch_connected_data.connect(self.fetch_data_from_connected_nodes)
+        self.properties_panel.node_config_changed.connect(lambda *_: QTimer.singleShot(0, self._add_side_expand_buttons))
+        try:
+            self.log_message("Panel de propiedades reiniciado tras clic en fondo")
+        except Exception:
+            pass
+        try:
+            setattr(panel, '_ui_rebuilding', False)
+        except Exception:
+            pass
+
+    def _remember_last_selected_node(self, node_id, node_type, node_data):
+        """Guarda el último node_id seleccionado para usarlo en modales de datos."""
+        try:
+            self._last_selected_node = node_id
+        except Exception:
+            pass
+
+    def _add_side_expand_buttons(self):
+        """Añade botones '⤢' al lado de tablas/tabs del panel de propiedades."""
+        panel = self.properties_panel
+        if not hasattr(self, '_side_wrapped'):
+            self._side_wrapped = set()
+        # Limpiar restos de overlays antiguos si hubiera
+        if hasattr(self, '_overlay_buttons') and self._overlay_buttons:
+            try:
+                for tbl, btn in list(self._overlay_buttons.items()):
+                    try:
+                        vp = tbl.viewport()
+                        vp.removeEventFilter(self)
+                    except Exception:
+                        pass
+                    try:
+                        btn.hide()
+                        btn.setParent(None)
+                    except Exception:
+                        pass
+                self._overlay_buttons.clear()
+            except Exception:
+                pass
+
+        def wrap_table(tbl: QTableWidget, title: str, open_mode: str = 'df'):
+            if tbl is None:
+                return
+            if int(tbl.property('has_side_expand') or 0) == 1:
+                return
+            # Buscar layout ancestro que contenga directamente a la tabla
+            parent = tbl.parent()
+            for _ in range(6):
+                if parent is None:
+                    break
+                lay = getattr(parent, 'layout', lambda: None)()
+                if lay is None:
+                    parent = parent.parent()
+                    continue
+                # QBoxLayouts
+                try:
+                    idx = lay.indexOf(tbl)
+                except Exception:
+                    idx = -1
+                if idx != -1:
+                    # Quitar y reemplazar por contenedor con botón
+                    try:
+                        lay.removeWidget(tbl)
+                    except Exception:
+                        pass
+                    container = QWidget(parent)
+                    hl = QHBoxLayout(container)
+                    hl.setContentsMargins(0, 0, 0, 0)
+                    hl.setSpacing(6)
+                    hl.addWidget(tbl)
+                    side = QVBoxLayout()
+                    side.setContentsMargins(0, 0, 0, 0)
+                    side.setSpacing(6)
+                    btn = QToolButton(container)
+                    btn.setText("⤢")
+                    btn.setToolTip(f"Expandir {title}")
+                    btn.setFixedSize(24, 24)
+                    btn.setStyleSheet("background-color: rgba(0,0,0,0.06); border: 1px solid #888; border-radius: 4px;")
+                    if open_mode == 'clone':
+                        btn.clicked.connect(lambda _=False, t=tbl, ti=title: self._open_table_preview_modal(ti, t))
+                    else:
+                        btn.clicked.connect(lambda _=False: self._open_dataframe_modal_for_node(getattr(self, '_last_selected_node', None) or getattr(self.properties_panel, 'current_node_id', None)))
+                    side.addWidget(btn, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
+                    side.addStretch(1)
+                    hl.addLayout(side)
+                    try:
+                        lay.insertWidget(idx, container)
+                    except Exception:
+                        lay.addWidget(container)
+                    try:
+                        tbl.setProperty('has_side_expand', 1)
+                    except Exception:
+                        pass
+                    return
+                # QFormLayout
+                if isinstance(lay, QFormLayout):
+                    try:
+                        idx = lay.indexOf(tbl)
+                        if idx != -1:
+                            row, role = lay.getItemPosition(idx)
+                            try:
+                                lay.removeWidget(tbl)
+                            except Exception:
+                                pass
+                            container = QWidget(parent)
+                            hl = QHBoxLayout(container)
+                            hl.setContentsMargins(0, 0, 0, 0)
+                            hl.setSpacing(6)
+                            hl.addWidget(tbl)
+                            side = QVBoxLayout()
+                            side.setContentsMargins(0, 0, 0, 0)
+                            side.setSpacing(6)
+                            btn = QToolButton(container)
+                            btn.setText("⤢")
+                            btn.setToolTip(f"Expandir {title}")
+                            btn.setFixedSize(24, 24)
+                            btn.setStyleSheet("background-color: rgba(0,0,0,0.06); border: 1px solid #888; border-radius: 4px;")
+                            if open_mode == 'clone':
+                                btn.clicked.connect(lambda _=False, t=tbl, ti=title: self._open_table_preview_modal(ti, t))
+                            else:
+                                btn.clicked.connect(lambda _=False: self._open_dataframe_modal_for_node(getattr(self, '_last_selected_node', None) or getattr(self.properties_panel, 'current_node_id', None)))
+                            side.addWidget(btn, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
+                            side.addStretch(1)
+                            hl.addLayout(side)
+                            lay.setWidget(row, QFormLayout.ItemRole.FieldRole, container)
+                            try:
+                                tbl.setProperty('has_side_expand', 1)
+                            except Exception:
+                                pass
+                            return
+                    except Exception:
+                        pass
+                parent = parent.parent()
+
+        def wrap_tabs(tabs: QTabWidget, title: str):
+            if tabs is None:
+                return
+            if int(tabs.property('has_side_expand') or 0) == 1:
+                return
+            parent = tabs.parent()
+            for _ in range(6):
+                if parent is None:
+                    break
+                lay = getattr(parent, 'layout', lambda: None)()
+                if lay is None:
+                    parent = parent.parent()
+                    continue
+                try:
+                    idx = lay.indexOf(tabs)
+                except Exception:
+                    idx = -1
+                if idx != -1:
+                    try:
+                        lay.removeWidget(tabs)
+                    except Exception:
+                        pass
+                    container = QWidget(parent)
+                    hl = QHBoxLayout(container)
+                    hl.setContentsMargins(0, 0, 0, 0)
+                    hl.setSpacing(6)
+                    hl.addWidget(tabs)
+                    side = QVBoxLayout()
+                    side.setContentsMargins(0, 0, 0, 0)
+                    side.setSpacing(6)
+                    btn = QToolButton(container)
+                    btn.setText("⤢")
+                    btn.setToolTip(f"Expandir {title}")
+                    btn.setFixedSize(24, 24)
+                    btn.setStyleSheet("background-color: rgba(0,0,0,0.06); border: 1px solid #888; border-radius: 4px;")
+                    btn.clicked.connect(lambda _=False, tb=tabs, ti=title: self._open_current_tab_table_modal(tb, ti))
+                    side.addWidget(btn, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
+                    side.addStretch(1)
+                    hl.addLayout(side)
+                    try:
+                        lay.insertWidget(idx, container)
+                    except Exception:
+                        lay.addWidget(container)
+                    try:
+                        tabs.setProperty('has_side_expand', 1)
+                    except Exception:
+                        pass
+                    return
+                if isinstance(lay, QFormLayout):
+                    try:
+                        idx = lay.indexOf(tabs)
+                        if idx != -1:
+                            row, role = lay.getItemPosition(idx)
+                            try:
+                                lay.removeWidget(tabs)
+                            except Exception:
+                                pass
+                            container = QWidget(parent)
+                            hl = QHBoxLayout(container)
+                            hl.setContentsMargins(0, 0, 0, 0)
+                            hl.setSpacing(6)
+                            hl.addWidget(tabs)
+                            side = QVBoxLayout()
+                            side.setContentsMargins(0, 0, 0, 0)
+                            side.setSpacing(6)
+                            btn = QToolButton(container)
+                            btn.setText("⤢")
+                            btn.setToolTip(f"Expandir {title}")
+                            btn.setFixedSize(24, 24)
+                            btn.setStyleSheet("background-color: rgba(0,0,0,0.06); border: 1px solid #888; border-radius: 4px;")
+                            btn.clicked.connect(lambda _=False, tb=tabs, ti=title: self._open_current_tab_table_modal(tb, ti))
+                            side.addWidget(btn, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
+                            side.addStretch(1)
+                            hl.addLayout(side)
+                            lay.setWidget(row, QFormLayout.ItemRole.FieldRole, container)
+                            try:
+                                tabs.setProperty('has_side_expand', 1)
+                            except Exception:
+                                pass
+                            return
+                    except Exception:
+                        pass
+                parent = parent.parent()
+
+        # Determinar títulos según contexto del panel
+        try:
+            if hasattr(panel, 'data_table') and panel.data_table is not None:
+                # La vista previa debe abrir datos reales
+                wrap_table(panel.data_table, "Vista previa", open_mode='df')
+        except Exception:
+            pass
+        try:
+            title_cols = "Columnas"
+            if getattr(panel, 'current_node_type', None) == 'destination':
+                title_cols = "Columnas a guardar"
+            elif getattr(panel, 'current_node_type', None) == 'transform':
+                title_cols = "Columnas a pasar"
+            if hasattr(panel, 'column_selection_table') and panel.column_selection_table is not None:
+                # Para selección/renombrado, también abrir datos reales
+                wrap_table(panel.column_selection_table, title_cols, open_mode='df')
+        except Exception:
+            pass
+        try:
+            jf = getattr(panel, 'join_fields', None)
+            if isinstance(jf, dict) and jf.get('column_table') is not None:
+                wrap_table(jf['column_table'], "Columnas de salida", open_mode='df')
+        except Exception:
+            pass
+        try:
+            if hasattr(panel, 'filter_rules_table') and panel.filter_rules_table is not None:
+                wrap_table(panel.filter_rules_table, "Reglas de filtro", open_mode='df')
+        except Exception:
+            pass
+        try:
+            if hasattr(panel, 'agg_group_by_table') and panel.agg_group_by_table is not None:
+                wrap_table(panel.agg_group_by_table, "Group By", open_mode='df')
+        except Exception:
+            pass
+        try:
+            if hasattr(panel, 'agg_ops_table') and panel.agg_ops_table is not None:
+                wrap_table(panel.agg_ops_table, "Funciones", open_mode='df')
+        except Exception:
+            pass
+        # QTabWidget de datos de origen en Unión
+        try:
+            for tabs in panel.findChildren(QTabWidget):
+                wrap_tabs(tabs, "Datos de origen")
+        except Exception:
+            pass
+            # Envolver cualquier otra QTableWidget que no hayamos cubierto
+            try:
+                for tbl in panel.findChildren(QTableWidget):
+                    if int(tbl.property('has_side_expand') or 0) != 1:
+                        wrap_table(tbl, "Tabla", open_mode='df')
+            except Exception:
+                pass
+
+    def _open_current_tab_table_modal(self, tabs: QTabWidget, base_title: str):
+        try:
+            idx = tabs.currentIndex()
+            if idx < 0:
+                return
+            page = tabs.widget(idx)
+            title = f"{base_title}: {tabs.tabText(idx)}"
+            tbl = page.findChild(QTableWidget)
+            if tbl is not None:
+                self._open_table_preview_modal(title, tbl)
+        except Exception:
+            pass
+
+    def _open_dataframe_modal_for_node(self, node_id, max_rows: int = 100, _retry: bool = False):
+        # Intentar obtener DF actual
+        df = None
+        try:
+            if node_id is None and hasattr(self, '_last_selected_node'):
+                node_id = self._last_selected_node
+        except Exception:
+            pass
+        try:
+            df = self.properties_panel.get_node_dataframe(node_id)
+        except Exception:
+            df = None
+        if df is None:
+            # Intentar construir preview automáticamente para transform/destination
+            try:
+                node_type = self.pipeline_canvas.graph.nodes[node_id]['type'] if node_id in self.pipeline_canvas.graph.nodes else None
+            except Exception:
+                node_type = None
+            if node_type in ('transform', 'destination') and not _retry:
+                try:
+                    self.fetch_data_from_connected_nodes(node_id)
+                except Exception:
+                    pass
+                # Reintentar abrir el modal luego de una breve espera
+                QTimer.singleShot(250, lambda: self._open_dataframe_modal_for_node(node_id, max_rows, _retry=True))
+                return
+            QMessageBox.information(self, "Vista previa", "No hay datos para mostrar")
+            return
+        self._open_dataframe_modal("Vista previa de datos", df, max_rows)
+
+    def _open_dataframe_modal(self, title: str, df, max_rows: int = 100):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        v = QVBoxLayout(dlg)
+        table = QTableWidget()
+        try:
+            rows = min(max_rows, len(df))
+            cols = list(df.columns)
+        except Exception:
+            rows = 0
+            cols = []
+        table.setRowCount(rows)
+        table.setColumnCount(len(cols))
+        if cols:
+            table.setHorizontalHeaderLabels(cols)
+        for i in range(rows):
+            for j, col in enumerate(cols):
+                try:
+                    item = QTableWidgetItem(str(df[col][i]))
+                except Exception:
+                    item = QTableWidgetItem("")
+                table.setItem(i, j, item)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        v.addWidget(table)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        v.addWidget(btns)
+        dlg.resize(900, 500)
+        dlg.exec()
+
+    def _open_table_preview_modal(self, title: str, source_table: QTableWidget):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        v = QVBoxLayout(dlg)
+        clone = QTableWidget()
+        try:
+            cols = source_table.columnCount()
+            rows = source_table.rowCount()
+        except Exception:
+            cols = 0
+            rows = 0
+        clone.setRowCount(rows)
+        clone.setColumnCount(cols)
+        headers = []
+        for c in range(cols):
+            header_item = source_table.horizontalHeaderItem(c)
+            headers.append(header_item.text() if header_item else f"Col {c+1}")
+        if headers:
+            clone.setHorizontalHeaderLabels(headers)
+        for r in range(rows):
+            for c in range(cols):
+                src_item = source_table.item(r, c)
+                text_val = None
+                if src_item is not None:
+                    if src_item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                        text_val = '✔' if src_item.checkState() == Qt.CheckState.Checked else '✘'
+                    else:
+                        text_val = src_item.text()
+                if text_val is None:
+                    w = source_table.cellWidget(r, c)
+                    if hasattr(w, 'text'):
+                        try:
+                            text_val = w.text()
+                        except Exception:
+                            text_val = None
+                clone.setItem(r, c, QTableWidgetItem(text_val or ""))
+        clone.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        v.addWidget(clone)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        v.addWidget(btns)
+        dlg.resize(800, 500)
+        dlg.exec()
 
     def _apply_select_and_rename_preview(self, df, config):
         """Aplica selección y renombrado de columnas para previsualización.

@@ -137,13 +137,32 @@ class NodeItem(QGraphicsEllipseItem):
         """Menú contextual para el nodo"""
         menu = QMenu()
         
+        # Acción de cambiar nombre
+        rename_action = menu.addAction("Cambiar Nombre")
+        
+        # Acción de duplicar nodo
+        duplicate_action = menu.addAction("Duplicar Nodo")
+        
+        # Separador
+        menu.addSeparator()
+        
         # Acción de eliminar nodo
-        delete_action = menu.addAction("Eliminar nodo")
+        delete_action = menu.addAction("Eliminar Nodo")
         
         # Mostrar el menú
         action = menu.exec(event.screenPos())
         
-        if action == delete_action:
+        if action == rename_action:
+            # Emitir señal para cambiar nombre del nodo
+            if self.scene():
+                canvas = self.scene().views()[0]
+                canvas.rename_node(self.node_id)
+        elif action == duplicate_action:
+            # Emitir señal para duplicar el nodo
+            if self.scene():
+                canvas = self.scene().views()[0]
+                canvas.duplicate_node(self.node_id)
+        elif action == delete_action:
             # Emitir señal para eliminar el nodo
             if self.scene():
                 canvas = self.scene().views()[0]
@@ -153,6 +172,7 @@ class PipelineCanvas(QGraphicsView):
     node_dropped = pyqtSignal(str, QPointF)  # Señal cuando se suelta un nodo
     node_selected = pyqtSignal(int, str, dict)  # Señal cuando se selecciona un nodo
     connection_created = pyqtSignal(str)  # Señal para notificar conexiones establecidas
+    background_clicked = pyqtSignal()  # Señal cuando se hace clic en el fondo (sin nodo)
     
     def __init__(self):
         super().__init__()
@@ -169,7 +189,11 @@ class PipelineCanvas(QGraphicsView):
         self.graph = nx.DiGraph()
         
         # Set up the background
-        self.setBackgroundBrush(QBrush(QColor(240, 240, 240)))
+        self.setBackgroundBrush(QBrush(QColor(250, 250, 250)))
+        
+        # Grid configuration
+        self.grid_size = 20  # Size of grid squares
+        self.grid_color = QColor(220, 220, 220)  # Light gray for grid lines
         
         # Variables para la interacción
         self.dragging = False
@@ -179,6 +203,10 @@ class PipelineCanvas(QGraphicsView):
         self.temp_line = None
         self.temp_connection_point = None
         self.arrows = {}  # Diccionario de flechas por (source_id, target_id)
+        
+        # Variables para panning
+        self.panning = False
+        self.last_pan_point = QPointF()
         
         # Nombres descriptivos para tipos de nodos
         self.node_type_names = {
@@ -209,7 +237,37 @@ class PipelineCanvas(QGraphicsView):
             'cast': 'Casteo',
         }
 
-    def _format_node_name(self, node_type, subtype):
+    def drawBackground(self, painter, rect):
+        """Draw a grid background"""
+        # Fill background with base color
+        painter.fillRect(rect, QBrush(QColor(250, 250, 250)))
+        
+        # Set up pen for grid lines
+        pen = QPen(self.grid_color, 1)
+        painter.setPen(pen)
+        
+        # Calculate grid boundaries
+        left = int(rect.left()) - (int(rect.left()) % self.grid_size)
+        top = int(rect.top()) - (int(rect.top()) % self.grid_size)
+        
+        # Draw vertical lines
+        x = left
+        while x < rect.right():
+            painter.drawLine(x, int(rect.top()), x, int(rect.bottom()))
+            x += self.grid_size
+            
+        # Draw horizontal lines
+        y = top
+        while y < rect.bottom():
+            painter.drawLine(int(rect.left()), y, int(rect.right()), y)
+            y += self.grid_size
+
+    def _format_node_name(self, node_type, subtype, config=None):
+        # Si hay un nombre personalizado, usarlo
+        if config and 'custom_name' in config:
+            return config['custom_name']
+        
+        # Usar el formato estándar
         node_name = self.node_type_names.get(node_type, node_type)
         if subtype:
             display = self.subtype_display_map.get(subtype, None)
@@ -655,7 +713,7 @@ class PipelineCanvas(QGraphicsView):
             node_item.setup_connection_points()
 
             # Actualizar el texto del nodo (buscar el QGraphicsTextItem hijo)
-            node_name = self._format_node_name(node_type, subtype)
+            node_name = self._format_node_name(node_type, subtype, config)
             for child in node_item.childItems():
                 if isinstance(child, QGraphicsTextItem):
                     child.setPlainText(node_name)
@@ -756,17 +814,18 @@ class PipelineCanvas(QGraphicsView):
         """Draw a node on the canvas"""
         node = self.graph.nodes[node_id]
         node_type = node['type']
+        config = node.get('config', {})
         
         # Create node visual representation
         if node_type == 'source':
             color = QColor(100, 200, 100)  # Green for sources
-            node_name = self._format_node_name(node_type, subtype)
+            node_name = self._format_node_name(node_type, subtype, config)
         elif node_type == 'transform':
             color = QColor(200, 200, 100)  # Yellow for transforms
-            node_name = self._format_node_name(node_type, subtype)
+            node_name = self._format_node_name(node_type, subtype, config)
         elif node_type == 'destination':
             color = QColor(200, 100, 100)  # Red for destinations
-            node_name = self._format_node_name(node_type, subtype)
+            node_name = self._format_node_name(node_type, subtype, config)
             
         # Create the node item
         node_item = NodeItem(position.x() - 40, position.y() - 40, 80, 80, 
@@ -873,6 +932,13 @@ class PipelineCanvas(QGraphicsView):
                 # Deselect all nodes
                 for item in self.scene.selectedItems():
                     item.setSelected(False)
+                # Emitir señal de clic en el fondo para vaciar el panel de propiedades
+                self.background_clicked.emit()
+                
+                # Iniciar panning si no hay nodo seleccionado
+                self.panning = True
+                self.last_pan_point = event.pos()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 
         super().mousePressEvent(event)
         
@@ -897,6 +963,17 @@ class PipelineCanvas(QGraphicsView):
         if self.temp_line and self.temp_connection_point:
             start_pos = self.temp_connection_point.get_scene_pos()
             self.temp_line.setLine(QLineF(start_pos, pos))
+            return
+            
+        # Si estamos haciendo panning
+        if self.panning:
+            # Calcular el desplazamiento
+            delta = event.pos() - self.last_pan_point
+            self.last_pan_point = event.pos()
+            
+            # Aplicar el desplazamiento a la vista
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
             return
             
         # Si estamos arrastrando un nodo
@@ -1063,6 +1140,11 @@ class PipelineCanvas(QGraphicsView):
                 self.dragging = False
                 self.current_node = None
                 
+            # Si estamos haciendo panning
+            if self.panning:
+                self.panning = False
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                
         super().mouseReleaseEvent(event)
         
     def delete_node(self, node_id):
@@ -1099,4 +1181,104 @@ class PipelineCanvas(QGraphicsView):
         factor = 1.2
         if event.angleDelta().y() < 0:
             factor = 1.0 / factor
-        self.scale(factor, factor) 
+        self.scale(factor, factor)
+    
+    def rename_node(self, node_id):
+        """Permite cambiar el nombre personalizado de un nodo"""
+        from PyQt6.QtWidgets import QInputDialog
+        
+        try:
+            # Obtener el nodo
+            node_item = self.find_node_by_id(node_id)
+            if not node_item:
+                return
+            
+            # Obtener nombre actual
+            current_name = ""
+            node_data = self.graph.nodes[node_id]
+            config = node_data.get('config', {})
+            
+            # Verificar si ya tiene un nombre personalizado
+            if 'custom_name' in config:
+                current_name = config['custom_name']
+            else:
+                # Usar el nombre por defecto basado en tipo/subtipo
+                current_name = self._format_node_name(node_data['type'], config.get('subtype'))
+            
+            # Mostrar diálogo para cambiar nombre
+            new_name, ok = QInputDialog.getText(
+                None, 
+                "Cambiar Nombre del Nodo", 
+                f"Nuevo nombre para el nodo {node_id}:",
+                text=current_name
+            )
+            
+            if ok and new_name.strip():
+                # Guardar el nombre personalizado en la configuración
+                config['custom_name'] = new_name.strip()
+                self.graph.nodes[node_id]['config'] = config
+                
+                # Actualizar el texto visual del nodo
+                for child in node_item.childItems():
+                    if isinstance(child, QGraphicsTextItem):
+                        child.setPlainText(new_name.strip())
+                        break
+                
+                print(f"Nodo {node_id} renombrado a: {new_name.strip()}")
+                
+        except Exception as e:
+            print(f"Error renombrando nodo {node_id}: {e}")
+    
+    def duplicate_node(self, node_id):
+        """Duplicar un nodo con su configuración"""
+        try:
+            # Obtener el nodo original
+            if node_id not in self.graph.nodes:
+                return
+            
+            original_node = self.graph.nodes[node_id]
+            original_item = self.find_node_by_id(node_id)
+            
+            if not original_item:
+                return
+            
+            # Obtener datos del nodo original
+            node_type = original_node['type']
+            original_config = original_node.get('config', {}).copy()
+            subtype = original_config.get('subtype')
+            
+            # Limpiar datos específicos que no deben duplicarse
+            if 'dataframe' in original_config:
+                del original_config['dataframe']
+            if 'other_dataframe' in original_config:
+                del original_config['other_dataframe']
+            
+            # Calcular nueva posición (desplazada)
+            original_pos = original_item.pos()
+            new_position = QPointF(original_pos.x() + 100, original_pos.y() + 50)
+            
+            # Crear el nuevo nodo
+            new_node_id = self.add_node(node_type, new_position, subtype)
+            
+            # Copiar la configuración (excepto datos)
+            if new_node_id in self.graph.nodes:
+                self.graph.nodes[new_node_id]['config'].update(original_config)
+                
+                # Si tenía nombre personalizado, agregar "(Copia)"
+                if 'custom_name' in original_config:
+                    original_name = original_config['custom_name']
+                    new_name = f"{original_name} (Copia)"
+                    self.graph.nodes[new_node_id]['config']['custom_name'] = new_name
+                    
+                    # Actualizar el texto visual
+                    new_item = self.find_node_by_id(new_node_id)
+                    if new_item:
+                        for child in new_item.childItems():
+                            if isinstance(child, QGraphicsTextItem):
+                                child.setPlainText(new_name)
+                                break
+            
+            print(f"Nodo {node_id} duplicado como nodo {new_node_id}")
+            
+        except Exception as e:
+            print(f"Error duplicando nodo {node_id}: {e}")
