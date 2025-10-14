@@ -1,7 +1,8 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QPushButton, 
                             QFileDialog, QTableWidget, QTableWidgetItem,
                             QComboBox, QLineEdit, QFormLayout, QGroupBox,
-                            QHBoxLayout, QMessageBox, QTabWidget, QCheckBox)
+                            QHBoxLayout, QMessageBox, QTabWidget, QCheckBox,
+                            QScrollArea)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 import polars as pl
 import pandas as pd
@@ -59,13 +60,41 @@ class PropertiesPanel(QWidget):
             self._pending_autosave = None
         
     def setup_ui(self):
-        self.layout = QVBoxLayout()
-        self.setLayout(self.layout)
+        # Layout principal del panel
+        main_layout = QVBoxLayout()
+        self.setLayout(main_layout)
+        
+        # Crear área de scroll
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)  # Sin borde para apariencia más limpia
+        
+        # Widget contenedor para el contenido scrolleable
+        self.scroll_widget = QWidget()
+        self.layout = QVBoxLayout(self.scroll_widget)
+        self.layout.setContentsMargins(5, 5, 5, 5)
+        self.layout.setSpacing(8)  # Espaciado consistente entre elementos
         
         # Panel vacío inicial
         self.empty_label = QLabel("Seleccione un nodo para configurar")
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.layout.addWidget(self.empty_label)
+        
+        # Configurar el scroll area
+        self.scroll_area.setWidget(self.scroll_widget)
+        main_layout.addWidget(self.scroll_area)
+    
+    def _ensure_scroll_visibility(self):
+        """Asegura que el contenido nuevo sea visible en el scroll area."""
+        try:
+            # Actualizar el tamaño del widget de scroll
+            self.scroll_widget.adjustSize()
+            # Hacer scroll hacia abajo para mostrar contenido nuevo
+            QTimer.singleShot(100, lambda: self.scroll_area.ensureVisible(0, self.scroll_widget.height()))
+        except Exception:
+            pass
         
     def show_node_properties(self, node_id, node_type, node_data):
         # Activar bandera de reconstrucción para evitar autosaves reentrantes
@@ -147,6 +176,9 @@ class PropertiesPanel(QWidget):
             self.show_transform_properties(node_id, self.current_node_data)
         elif node_type == 'destination':
             self.show_destination_properties(node_id, self.current_node_data)
+        
+        # Asegurar que el contenido sea visible en el scroll
+        self._ensure_scroll_visibility()
         self._ui_rebuilding = False
             
     def show_source_properties(self, node_id, node_data):

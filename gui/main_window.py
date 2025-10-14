@@ -1068,8 +1068,198 @@ class MainWindow(QMainWindow):
                 self.pipeline_canvas.add_edge_simple(src, dst)
 
             self.log_message(f"Pipeline cargado desde {path}")
-            QMessageBox.information(self, "Cargado", "Pipeline cargado correctamente.")
+            
+            # Auto-obtener datos para nodos de origen
+            self._auto_fetch_source_data()
+            
+            QMessageBox.information(self, "Cargado", "Pipeline cargado correctamente.\nDatos de origen obtenidos automáticamente.")
         except Exception as e:
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self, "Error", f"Error al abrir pipeline: {e}")
+    
+    def _auto_fetch_source_data(self):
+        """Obtiene automáticamente los datos para todos los nodos de origen después de cargar un pipeline."""
+        try:
+            source_nodes = []
+            # Identificar todos los nodos de origen
+            for node_id in self.pipeline_canvas.graph.nodes:
+                node = self.pipeline_canvas.graph.nodes[node_id]
+                if node.get('type') == 'source':
+                    source_nodes.append(node_id)
+            
+            if not source_nodes:
+                self.log_message("No se encontraron nodos de origen para auto-obtener datos")
+                return
+            
+            self.log_message(f"Auto-obteniendo datos para {len(source_nodes)} nodos de origen...")
+            
+            # Procesar cada nodo de origen
+            for node_id in source_nodes:
+                try:
+                    self._auto_fetch_single_source(node_id)
+                except Exception as e:
+                    self.log_message(f"Error auto-obteniendo datos del nodo {node_id}: {e}")
+                    continue
+            
+            self.log_message("Auto-obtención de datos completada")
+            
+        except Exception as e:
+            self.log_message(f"Error en auto-obtención de datos: {e}")
+    
+    def _auto_fetch_single_source(self, node_id):
+        """Obtiene automáticamente los datos de un nodo de origen específico."""
+        node = self.pipeline_canvas.graph.nodes[node_id]
+        config = node.get('config', {})
+        subtype = config.get('subtype', '').lower()
+        
+        self.log_message(f"Auto-obteniendo datos del nodo {node_id} (subtype: {subtype})")
+        
+        if subtype == 'database':
+            # Auto-obtener datos de base de datos
+            self._auto_fetch_database_data(node_id, config)
+        elif subtype in ['csv', 'excel', 'json', 'parquet']:
+            # Auto-cargar archivos
+            self._auto_load_file_data(node_id, config, subtype)
+        else:
+            self.log_message(f"Subtype '{subtype}' no soportado para auto-obtención")
+    
+    def _auto_fetch_database_data(self, node_id, config):
+        """Auto-obtiene datos de una base de datos configurada."""
+        try:
+            # Verificar que todos los campos necesarios estén presentes
+            required_fields = ['db_type', 'host', 'user', 'database', 'query']
+            missing_fields = [field for field in required_fields if not config.get(field)]
+            
+            if missing_fields:
+                self.log_message(f"Nodo {node_id}: Faltan campos de BD: {missing_fields}")
+                return
+            
+            db_type = config['db_type']
+            host = config['host']
+            port = config.get('port', '')
+            user = config['user']
+            password = config.get('password', '')
+            database = config['database']
+            query = config['query']
+            
+            # Construir URL de conexión
+            from sqlalchemy import create_engine, text
+            from sqlalchemy.engine import URL
+            import pandas as pd
+            import polars as pl
+            
+            url = None
+            connect_args = {}
+            
+            if db_type == 'MySQL':
+                url = URL.create(
+                    drivername='mysql+pymysql',
+                    username=user or None,
+                    password=password or None,
+                    host=host or None,
+                    port=int(port) if port else None,
+                    database=database or None,
+                )
+                connect_args = {'connect_timeout': 10}
+            elif db_type == 'PostgreSQL':
+                url = URL.create(
+                    drivername='postgresql+psycopg2',
+                    username=user or None,
+                    password=password or None,
+                    host=host or None,
+                    port=int(port) if port else None,
+                    database=database or None,
+                )
+                connect_args = {'connect_timeout': 10}
+            elif db_type == 'SQL Server':
+                url = URL.create(
+                    drivername='mssql+pyodbc',
+                    username=user or None,
+                    password=password or None,
+                    host=host or None,
+                    port=int(port) if port else None,
+                    database=database or None,
+                    query={'driver': 'ODBC Driver 17 for SQL Server'}
+                )
+                connect_args = {'timeout': 10}
+            elif db_type == 'SQLite':
+                url = URL.create(drivername='sqlite', database=database)
+            else:
+                self.log_message(f"Tipo de BD no soportado: {db_type}")
+                return
+            
+            # Ejecutar consulta
+            engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args or {})
+            with engine.connect() as conn:
+                pdf = pd.read_sql(text(query), conn)
+            
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+            
+            # Convertir a Polars
+            df = pl.from_pandas(pdf) if hasattr(pdf, 'columns') else pl.DataFrame(pdf)
+            
+            # Guardar en configuración
+            config['dataframe'] = df
+            self.pipeline_canvas.graph.nodes[node_id]['config'] = config
+            self.properties_panel.node_configs[node_id] = config
+            self.properties_panel.current_dataframes[node_id] = df
+            
+            self.log_message(f"Nodo {node_id}: Datos de BD obtenidos automáticamente ({len(df)} filas)")
+            
+        except Exception as e:
+            self.log_message(f"Error auto-obteniendo datos de BD del nodo {node_id}: {e}")
+    
+    def _auto_load_file_data(self, node_id, config, file_type):
+        """Auto-carga datos de un archivo configurado."""
+        try:
+            file_path = config.get('path')
+            if not file_path:
+                self.log_message(f"Nodo {node_id}: No hay ruta de archivo configurada")
+                return
+            
+            import os
+            if not os.path.exists(file_path):
+                self.log_message(f"Nodo {node_id}: Archivo no encontrado: {file_path}")
+                return
+            
+            import pandas as pd
+            import polars as pl
+            
+            # Cargar según el tipo de archivo
+            if file_type == 'csv':
+                try:
+                    df = pl.read_csv(file_path)
+                except:
+                    try:
+                        df = pl.read_csv(file_path, encoding='latin-1')
+                    except:
+                        pdf = pd.read_csv(file_path, encoding='latin-1')
+                        df = pl.from_pandas(pdf)
+            elif file_type == 'excel':
+                try:
+                    df = pl.read_excel(file_path)
+                except:
+                    pdf = pd.read_excel(file_path)
+                    df = pl.from_pandas(pdf)
+            elif file_type == 'json':
+                df = pl.read_json(file_path)
+            elif file_type == 'parquet':
+                df = pl.read_parquet(file_path)
+            else:
+                self.log_message(f"Tipo de archivo no soportado: {file_type}")
+                return
+            
+            # Guardar en configuración
+            config['dataframe'] = df
+            self.pipeline_canvas.graph.nodes[node_id]['config'] = config
+            self.properties_panel.node_configs[node_id] = config
+            self.properties_panel.current_dataframes[node_id] = df
+            
+            self.log_message(f"Nodo {node_id}: Archivo {file_type.upper()} cargado automáticamente ({len(df)} filas)")
+            
+        except Exception as e:
+            self.log_message(f"Error auto-cargando archivo del nodo {node_id}: {e}")
