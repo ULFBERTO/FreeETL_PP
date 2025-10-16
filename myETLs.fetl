@@ -1,0 +1,138 @@
+{
+  "version": "1.0",
+  "name": "myETLs",
+  "created_at": "2025-10-15T07:08:20",
+  "defaults": {
+    "max_parallel": 8,
+    "services": {
+      "port": 8080
+    },
+    "mcp": {
+      "lang": "es",
+      "ollama_base_url": "http://localhost:11434"
+    }
+  },
+  "etls": [
+    {
+      "id": "etl-001",
+      "name": "Nuevo ETL",
+      "content": {
+        "nodes": [
+          {
+            "id": 0,
+            "type": "source",
+            "position": {
+              "x": 2.0,
+              "y": 1.0
+            },
+            "config": {
+              "subtype": "csv"
+            }
+          }
+        ],
+        "edges": []
+      }
+    },
+    {
+      "id": "etl-002",
+      "name": "Nuevo ETL 2",
+      "content": {
+        "nodes": [],
+        "edges": []
+      }
+    },
+    {
+      "id": "etl-003",
+      "name": "Nuevo ETL 3",
+      "content": {
+        "nodes": [],
+        "edges": []
+      }
+    },
+    {
+      "id": "etl-004",
+      "name": "Nuevo ETL 4",
+      "content": {
+        "nodes": [],
+        "edges": []
+      }
+    },
+    {
+      "id": "etl-005",
+      "name": "Nuevo ETL 5",
+      "content": {
+        "nodes": [],
+        "edges": []
+      }
+    },
+    {
+      "id": "etl-006",
+      "name": "Nuevo ETL 6",
+      "content": {
+        "nodes": [],
+        "edges": []
+      }
+    },
+    {
+      "id": "etl-007",
+      "name": "Nuevo ETL 7",
+      "content": {
+        "nodes": [],
+        "edges": []
+      }
+    },
+    {
+      "id": "etl-008",
+      "name": "Nuevo ETL 8",
+      "content": {
+        "nodes": [],
+        "edges": []
+      }
+    },
+    {
+      "id": "etl-009",
+      "name": "Nuevo ETL 9",
+      "content": {
+        "nodes": [],
+        "edges": []
+      }
+    }
+  ],
+  "jobs": [
+    {
+      "id": "job-001",
+      "name": "Nuevo Job",
+      "on_error": "stop",
+      "max_parallel": 8,
+      "stages": [
+        {
+          "parallel": false,
+          "steps": [
+            {
+              "etl_id": "etl-001",
+              "overrides": {}
+            }
+          ]
+        }
+      ],
+      "schedule": {
+        "time": "00:00",
+        "days_of_week": [],
+        "indefinite": false,
+        "end_date": "2025-10-15"
+      }
+    }
+  ],
+  "services": [
+    {
+      "id": "1",
+      "name": "servicio1GG",
+      "port": null,
+      "auth": {
+        "basic_user": "mario",
+        "basic_pass": "1301"
+      }
+    }
+  ],
+  "runs": []
+}

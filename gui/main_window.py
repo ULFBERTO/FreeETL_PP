@@ -1,15 +1,23 @@
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                            QPushButton, QLabel, QMenuBar, QMenu, QStatusBar,
-                            QTextEdit, QSplitter, QMessageBox, QFileDialog,
-                            QToolButton, QDialog, QDialogButtonBox, QTableWidget,
-                            QTableWidgetItem, QAbstractItemView, QFormLayout,
-                            QTabWidget)
+                              QPushButton, QLabel, QMenuBar, QMenu, QStatusBar,
+                              QTextEdit, QSplitter, QMessageBox, QFileDialog,
+                              QToolButton, QDialog, QDialogButtonBox, QTableWidget,
+                              QTableWidgetItem, QAbstractItemView, QFormLayout,
+                              QTabWidget, QDockWidget, QStackedWidget)
 from PyQt6.QtCore import Qt, QTimer, QPointF
 from .pipeline_canvas import PipelineCanvas
 from .node_palette import NodePalette
 from .properties_panel import PropertiesPanel
 from core.etl_engine import ETLEngine
 import polars as pl
+from core.project_manager import ProjectManager
+from .project_settings_dialog import ProjectSettingsDialog
+from .jobs_tab import JobsTab
+from .project_explorer import ProjectExplorer
+from .services_tab import ServicesTab
+from .job_form import JobConfigForm
+from .service_form import ServiceConfigForm
+from .runs_tab import RunsTab
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -20,25 +28,37 @@ class MainWindow(QMainWindow):
         # Create central widget and layout
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
+        # Crear el menú temprano para evitar retardos visuales
+        try:
+            self.create_menu_bar()
+        except Exception:
+            pass
         
         # Usar un QSplitter para dividir la ventana
         self.main_splitter = QSplitter(Qt.Orientation.Vertical)
         
-        # Widget superior con layout horizontal
+        # Widget superior con un stack que alterna Diseñador/Forms
         self.top_widget = QWidget()
         main_layout = QHBoxLayout(self.top_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Create node palette
+        # Instanciar paleta de nodos (en panel lateral)
         self.node_palette = NodePalette()
-        main_layout.addWidget(self.node_palette)
         
-        # Create pipeline canvas
+        # Crear Designer page (canvas + propiedades)
         self.pipeline_canvas = PipelineCanvas()
-        main_layout.addWidget(self.pipeline_canvas)
-        
-        # Create properties panel
         self.properties_panel = PropertiesPanel()
-        main_layout.addWidget(self.properties_panel)
+        self.designer_page = QWidget()
+        _designer_h = QHBoxLayout(self.designer_page)
+        _designer_h.setContentsMargins(0, 0, 0, 0)
+        _designer_h.addWidget(self.pipeline_canvas)
+        _designer_h.addWidget(self.properties_panel)
+        
+        # Stacked widget con páginas: Diseñador, JobForm, ServiceForm
+        self.designer_stack = QStackedWidget()
+        self.designer_stack.addWidget(self.designer_page)  # index 0
+        # Forms se agregarán tras inicializar ProjectManager
+        main_layout.addWidget(self.designer_stack)
         
         # Agregar widget superior al splitter
         self.main_splitter.addWidget(self.top_widget)
@@ -55,17 +75,190 @@ class MainWindow(QMainWindow):
         # Set sizes for splitter
         self.main_splitter.setSizes([600, 150])
         
-        # Agregar el splitter al layout principal
+        # Agregar el splitter a una pestaña "Diseñador" (contenedor derecho)
+        self.tabs = QTabWidget()
+        self.designer_container = QWidget()
+        designer_vlayout = QVBoxLayout(self.designer_container)
+        designer_vlayout.setContentsMargins(0, 0, 0, 0)
+        designer_vlayout.addWidget(self.main_splitter)
+        self.tabs.addTab(self.designer_container, "Diseñador")
+        
+        # Inicializar Project Manager antes de crear la pestaña Jobs
+        self.project_manager = ProjectManager()
+        
+        # Añadir panel lateral con pestañas (Proyecto/Paleta) y botón para ocultar/mostrar
+        try:
+            self.project_explorer = ProjectExplorer(self.project_manager, self)
+            # Cuando cambie el proyecto, refrescar JobsTab si existe
+            self.project_explorer.project_changed.connect(lambda _proj: getattr(self, 'jobs_tab', None) and self.jobs_tab.refresh())
+            # Refrescar ServicesTab si existe
+            self.project_explorer.project_changed.connect(lambda _proj: getattr(self, 'services_tab', None) and self.services_tab.refresh())
+            # Cargar/Guardar ETL desde/ hacia Diseñador
+            self.project_explorer.load_etl_requested.connect(self.load_etl_from_project)
+            self.project_explorer.save_etl_requested.connect(self.save_designer_into_etl)
+
+            # Crear tabs laterales usando la paleta ya instanciada
+            self.left_tabs = QTabWidget()
+            self.left_tabs.addTab(self.project_explorer, "Proyecto")
+            self.left_tabs.addTab(self.node_palette, "Paleta")
+
+            # Contenedor con cabecera (botón de colapsar)
+            self.left_container = QWidget()
+            _lc_v = QVBoxLayout(self.left_container)
+            _lc_v.setContentsMargins(0, 0, 0, 0)
+            _lc_v.setSpacing(4)
+            _lc_header = QHBoxLayout()
+            _lc_header.addWidget(QLabel("Panel"))
+            _lc_header.addStretch()
+            self.btn_toggle_left = QToolButton(self.left_container)
+            self.btn_toggle_left.setText("◀ Panel")
+            self.btn_toggle_left.setCheckable(True)
+            self.btn_toggle_left.toggled.connect(self._toggle_left_panel)
+            _lc_header.addWidget(self.btn_toggle_left)
+            _lc_v.addLayout(_lc_header)
+            _lc_v.addWidget(self.left_tabs)
+
+            # Marcar panel lateral como listo; lo colocaremos a nivel superior junto a las pestañas centrales
+            try:
+                self.left_container.setMinimumWidth(260)
+            except Exception:
+                pass
+        except Exception:
+            # Fallback: marca que no hay contenedor lateral, usaremos la paleta en el splitter central
+            try:
+                self.left_container = None
+            except Exception:
+                pass
+        
+        # Añadir formularios al stack ahora que hay ProjectManager
+        try:
+            self.job_form = JobConfigForm(self.project_manager, self)
+            self.service_form = ServiceConfigForm(self.project_manager, self)
+            self.job_form.on_change = lambda: getattr(self, 'project_explorer', None) and self.project_explorer.refresh()
+            self.service_form.on_change = lambda: getattr(self, 'project_explorer', None) and self.project_explorer.refresh()
+            self.designer_stack.addWidget(self.job_form)      # index 1
+            self.designer_stack.addWidget(self.service_form)  # index 2
+        except Exception:
+            pass
+
+        # Conectar selección de Job/Servicio desde el panel Proyecto
+        try:
+            self.project_explorer.job_selected.connect(self._on_job_selected)
+            self.project_explorer.service_selected.connect(self._on_service_selected)
+            # Cuando cambie el proyecto, refrescar también RunsTab
+            self.project_explorer.project_changed.connect(lambda _proj: getattr(self, 'runs_tab', None) and self.runs_tab.refresh())
+        except Exception:
+            pass
+
+        # Añadir pestaña Jobs
+        try:
+            self.jobs_tab = JobsTab(self.project_manager, self)
+            self.tabs.addTab(self.jobs_tab, "Jobs")
+        except Exception:
+            # Si falla la carga de la pestaña Jobs, continuar sin bloquear la app
+            pass
+        
+        # Añadir pestaña Servicios
+        try:
+            self.services_tab = ServicesTab(self.project_manager, self)
+            self.tabs.addTab(self.services_tab, "Servicios")
+        except Exception:
+            # Continuar si falla la carga de Servicios
+            pass
+
+        # Añadir pestaña Runs
+        try:
+            self.runs_tab = RunsTab(self.project_manager, self)
+            self.tabs.addTab(self.runs_tab, "Runs")
+        except Exception:
+            pass
+        
+        # Colocar las pestañas centrales en el área central del QMainWindow
         main_layout_vertical = QVBoxLayout(self.central_widget)
-        main_layout_vertical.addWidget(self.main_splitter)
+        main_layout_vertical.setContentsMargins(0, 0, 0, 0)
+        main_layout_vertical.addWidget(self.tabs)
+
+        # Crear un QDockWidget a la izquierda para el panel lateral (Proyecto/Paleta)
+        try:
+            self.left_dock = QDockWidget("Panel", self)
+            self.left_dock.setObjectName("LeftPanelDock")
+            self.left_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+            if hasattr(self, 'left_container') and self.left_container is not None:
+                self.left_dock.setWidget(self.left_container)
+            else:
+                self.left_dock.setWidget(self.node_palette)
+            self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.left_dock)
+            # Mantener sincronización con acción/botón cuando el usuario cierre/abra el dock
+            try:
+                self.left_dock.visibilityChanged.connect(self._sync_left_panel_visibility)
+            except Exception:
+                pass
+            try:
+                self.left_dock.setMinimumWidth(260)
+            except Exception:
+                pass
+        except Exception:
+            pass
         
         # Create ETL engine
         self.etl_engine = ETLEngine()
+        
+        # Project Manager ya inicializado arriba
         
         # Connect signals
         self.node_palette.node_selected.connect(self.handle_node_selected)
         self.pipeline_canvas.node_selected.connect(self.properties_panel.show_node_properties)
         self.properties_panel.node_config_changed.connect(self.handle_node_config_changed)
+        
+        # Página inicial: Diseñador
+        try:
+            self.designer_stack.setCurrentWidget(self.designer_page)
+        except Exception:
+            pass
+
+    def _switch_to_designer_tab(self):
+        try:
+            idx = self.tabs.indexOf(self.designer_container)
+            if idx != -1:
+                self.tabs.setCurrentIndex(idx)
+        except Exception:
+            pass
+
+    def _on_job_selected(self, job_id: str):
+        """Cuando se selecciona un Job en el panel Proyecto, mostrar formulario en el área del diseñador."""
+        try:
+            if job_id:
+                ok = False
+                try:
+                    ok = self.job_form.load_job_by_id(job_id)
+                except Exception:
+                    ok = False
+                if ok:
+                    self.designer_stack.setCurrentWidget(self.job_form)
+                    self._switch_to_designer_tab()
+                    return
+            # Si no hay selección o no se pudo cargar, volver al diseñador normal
+            self.designer_stack.setCurrentWidget(self.designer_page)
+        except Exception:
+            pass
+
+    def _on_service_selected(self, service_id: str):
+        """Cuando se selecciona un Servicio en el panel Proyecto, mostrar formulario en el área del diseñador."""
+        try:
+            if service_id:
+                ok = False
+                try:
+                    ok = self.service_form.load_service_by_id(service_id)
+                except Exception:
+                    ok = False
+                if ok:
+                    self.designer_stack.setCurrentWidget(self.service_form)
+                    self._switch_to_designer_tab()
+                    return
+            # Si no hay selección o no se pudo cargar, volver al diseñador normal
+            self.designer_stack.setCurrentWidget(self.designer_page)
+        except Exception:
+            pass
         self.pipeline_canvas.connection_created.connect(self.log_message)
         self.properties_panel.fetch_connected_data.connect(self.fetch_data_from_connected_nodes)
         # Reaplicar botones laterales de expandir cuando cambie la configuración y se reconstruya el panel
@@ -82,9 +275,6 @@ class MainWindow(QMainWindow):
         self.etl_engine.execution_progress.connect(self.log_message)
         self.etl_engine.execution_finished.connect(self.handle_execution_finished)
         self.etl_engine.node_executed.connect(self.handle_node_executed)
-        
-        # Create menu bar
-        self.create_menu_bar()
         
         # Create status bar
         self.statusBar().showMessage("Ready")
@@ -187,6 +377,50 @@ class MainWindow(QMainWindow):
         # Scroll to bottom
         scrollbar = self.log_panel.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def _toggle_left_panel(self, checked: bool):
+        """Muestra/oculta el panel lateral (Proyecto/Paleta)."""
+        try:
+            if hasattr(self, 'left_tabs') and self.left_tabs is not None:
+                self.left_tabs.setVisible(not checked)
+            if hasattr(self, 'btn_toggle_left') and self.btn_toggle_left is not None:
+                self.btn_toggle_left.setText("▶ Panel" if checked else "◀ Panel")
+            # Mostrar/ocultar el dock completo también
+            if hasattr(self, 'left_dock') and self.left_dock is not None:
+                self.left_dock.setVisible(not checked)
+            # Mantener sincronizada la acción del menú (checked significa visible)
+            if hasattr(self, 'act_toggle_left') and self.act_toggle_left is not None:
+                try:
+                    self.act_toggle_left.blockSignals(True)
+                    self.act_toggle_left.setChecked(not checked)
+                finally:
+                    self.act_toggle_left.blockSignals(False)
+        except Exception:
+            pass
+
+    def _sync_left_panel_visibility(self, visible: bool):
+        """Sincroniza el estado visible/invisible del dock con el botón y el menú."""
+        try:
+            # left_tabs dentro del dock
+            if hasattr(self, 'left_tabs') and self.left_tabs is not None:
+                self.left_tabs.setVisible(visible)
+            # Botón del header (checked = oculto)
+            if hasattr(self, 'btn_toggle_left') and self.btn_toggle_left is not None:
+                try:
+                    self.btn_toggle_left.blockSignals(True)
+                    self.btn_toggle_left.setChecked(not visible)
+                    self.btn_toggle_left.setText("▶ Panel" if not visible else "◀ Panel")
+                finally:
+                    self.btn_toggle_left.blockSignals(False)
+            # Acción del menú Ver (checked = visible)
+            if hasattr(self, 'act_toggle_left') and self.act_toggle_left is not None:
+                try:
+                    self.act_toggle_left.blockSignals(True)
+                    self.act_toggle_left.setChecked(visible)
+                finally:
+                    self.act_toggle_left.blockSignals(False)
+        except Exception:
+            pass
 
     def clear_properties_panel(self):
         """Limpia el panel de propiedades y muestra un mensaje vacío."""
@@ -696,13 +930,17 @@ class MainWindow(QMainWindow):
     def create_menu_bar(self):
         menubar = self.menuBar()
         
-        # File menu
-        file_menu = menubar.addMenu("Archivo")
-        new_action = file_menu.addAction("Nuevo Pipeline")
-        open_action = file_menu.addAction("Abrir Pipeline")
-        save_action = file_menu.addAction("Guardar Pipeline")
-        file_menu.addSeparator()
-        exit_action = file_menu.addAction("Salir")
+        # Proyecto
+        project_menu = menubar.addMenu("Proyecto")
+        new_project_action = project_menu.addAction("Nuevo Proyecto")
+        open_project_action = project_menu.addAction("Abrir Proyecto")
+        save_project_action = project_menu.addAction("Guardar Proyecto")
+        project_menu.addSeparator()
+        settings_action = project_menu.addAction("Ajustes del Proyecto")
+        project_menu.addSeparator()
+        save_etl_action = project_menu.addAction("Guardar ETL")
+        save_jobs_action = project_menu.addAction("Guardar Jobs")
+        save_services_action = project_menu.addAction("Guardar Servicios")
         
         # Edit menu
         edit_menu = menubar.addMenu("Editar")
@@ -715,13 +953,138 @@ class MainWindow(QMainWindow):
         stop_pipeline_action = run_menu.addAction("Detener Pipeline")
         
         # Connect actions
-        exit_action.triggered.connect(self.close)
         run_pipeline_action.triggered.connect(self.run_pipeline)
         stop_pipeline_action.triggered.connect(self.stop_pipeline)
-        new_action.triggered.connect(self.new_pipeline)
-        open_action.triggered.connect(self.open_pipeline)
-        save_action.triggered.connect(self.save_pipeline)
         
+        # Proyecto connections
+        new_project_action.triggered.connect(self.new_project)
+        open_project_action.triggered.connect(self.open_project)
+        save_project_action.triggered.connect(self.save_project)
+        settings_action.triggered.connect(self.open_project_settings)
+        save_etl_action.triggered.connect(self.save_selected_etl_menu)
+        save_jobs_action.triggered.connect(self.save_jobs_menu)
+        save_services_action.triggered.connect(self.save_services_menu)
+
+        # Ver (toggle panel lateral)
+        view_menu = menubar.addMenu("Ver")
+        self.act_toggle_left = view_menu.addAction("Panel lateral visible")
+        self.act_toggle_left.setCheckable(True)
+        self.act_toggle_left.setChecked(True)
+        # La acción indica visible=True; _toggle_left_panel espera checked=oculto
+        self.act_toggle_left.toggled.connect(lambda visible: self._toggle_left_panel(not visible))
+        
+    # ------------------ Proyecto (.fetl) ------------------
+    def new_project(self):
+        """Crea un nuevo proyecto .fetl y actualiza el título de la ventana."""
+        path, _ = QFileDialog.getSaveFileName(self, "Nuevo Proyecto", "", "FreeETL Project (*.fetl)")
+        if not path:
+            return
+        try:
+            proj = self.project_manager.create_new(path)
+            self.setWindowTitle(f"ETL Pipeline Builder - {proj.get('name', '')}")
+            self.log_message(f"Proyecto creado: {self.project_manager.path}")
+            # Refrescar vistas
+            if hasattr(self, 'project_explorer') and self.project_explorer is not None:
+                try:
+                    self.project_explorer.refresh()
+                    self.project_explorer.project_changed.emit(self.project_manager.project)
+                except Exception:
+                    pass
+            for tab_name in ('jobs_tab', 'services_tab', 'runs_tab'):
+                try:
+                    tab = getattr(self, tab_name, None)
+                    if tab:
+                        tab.refresh()
+                except Exception:
+                    pass
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"No se pudo crear el proyecto: {e}")
+
+    def open_project(self):
+        """Abre un proyecto .fetl existente y actualiza el título de la ventana."""
+        path, _ = QFileDialog.getOpenFileName(self, "Abrir Proyecto", "", "FreeETL Project (*.fetl)")
+        if not path:
+            return
+        try:
+            proj = self.project_manager.open(path)
+            self.setWindowTitle(f"ETL Pipeline Builder - {proj.get('name', '')}")
+            self.log_message(f"Proyecto abierto: {self.project_manager.path}")
+            # Refrescar vistas
+            if hasattr(self, 'project_explorer') and self.project_explorer is not None:
+                try:
+                    self.project_explorer.refresh()
+                    self.project_explorer.project_changed.emit(self.project_manager.project)
+                except Exception:
+                    pass
+            for tab_name in ('jobs_tab', 'services_tab', 'runs_tab'):
+                try:
+                    tab = getattr(self, tab_name, None)
+                    if tab:
+                        tab.refresh()
+                except Exception:
+                    pass
+            # Volver al diseñador por defecto
+            try:
+                self.designer_stack.setCurrentWidget(self.designer_page)
+                self._switch_to_designer_tab()
+            except Exception:
+                pass
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"No se pudo abrir el proyecto: {e}")
+
+    def save_project(self):
+        """Guarda el proyecto actual .fetl."""
+        try:
+            self.project_manager.save()
+            self.log_message(f"Proyecto guardado: {self.project_manager.path}")
+            QMessageBox.information(self, "Guardado", "Proyecto guardado correctamente.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"No se pudo guardar el proyecto: {e}")
+
+    def open_project_settings(self):
+        """Abre el diálogo de ajustes del proyecto y persiste los cambios."""
+        dlg = ProjectSettingsDialog(self, self.project_manager)
+        if dlg.exec():
+            try:
+                self.project_manager.save()
+                self.log_message("Ajustes del proyecto guardados")
+            except Exception:
+                pass
+
+    def save_selected_etl_menu(self) -> None:
+        """Guarda el contenido del Diseñador en el ETL seleccionado en el panel Proyecto."""
+        try:
+            eid = ""
+            if hasattr(self, 'project_explorer') and self.project_explorer is not None:
+                try:
+                    eid = self.project_explorer._selected_etl_id()
+                except Exception:
+                    eid = ""
+            if not eid:
+                QMessageBox.information(self, "Proyecto", "Selecciona un ETL en el panel Proyecto para guardar el Diseñador en él.")
+                return
+            self.save_designer_into_etl(eid)
+        except Exception as e:
+            QMessageBox.critical(self, "Proyecto", f"No se pudo guardar el ETL: {e}")
+
+    def save_jobs_menu(self) -> None:
+        """Persiste los Jobs del proyecto (.fetl)."""
+        try:
+            self.project_manager.save()
+            self.log_message("Jobs guardados en el proyecto")
+            QMessageBox.information(self, "Proyecto", "Jobs guardados correctamente.")
+        except Exception as e:
+            QMessageBox.critical(self, "Proyecto", f"No se pudieron guardar los Jobs: {e}")
+
+    def save_services_menu(self) -> None:
+        """Persiste los Servicios del proyecto (.fetl)."""
+        try:
+            self.project_manager.save()
+            self.log_message("Servicios guardados en el proyecto")
+            QMessageBox.information(self, "Proyecto", "Servicios guardados correctamente.")
+        except Exception as e:
+            QMessageBox.critical(self, "Proyecto", f"No se pudieron guardar los Servicios: {e}")
+
     def run_pipeline(self):
         """Ejecuta la pipeline actual"""
         self.statusBar().showMessage("Ejecutando pipeline...")
@@ -1078,6 +1441,112 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
             QMessageBox.critical(self, "Error", f"Error al abrir pipeline: {e}")
     
+    # ==== Integración Proyecto <-> Diseñador ====
+    def get_current_pipeline_content(self) -> dict:
+        """Serializa el pipeline actual a un dict con 'nodes' y 'edges'."""
+        data = {'nodes': [], 'edges': []}
+        # Serializar nodos
+        for node_id in self.pipeline_canvas.graph.nodes:
+            node = self.pipeline_canvas.graph.nodes[node_id]
+            pos = node.get('position')
+            if isinstance(pos, QPointF):
+                pos_dict = {'x': float(pos.x()), 'y': float(pos.y())}
+            elif isinstance(pos, (tuple, list)) and len(pos) == 2:
+                pos_dict = {'x': float(pos[0]), 'y': float(pos[1])}
+            else:
+                pos_dict = {'x': 0.0, 'y': 0.0}
+            config = (self.properties_panel.get_node_config(node_id) or {}).copy()
+            if not config:
+                config = node.get('config', {}).copy()
+            config.pop('dataframe', None)
+            config.pop('other_dataframe', None)
+            data['nodes'].append({
+                'id': int(node_id),
+                'type': node.get('type'),
+                'position': pos_dict,
+                'config': config,
+            })
+        # Serializar edges
+        for (src, dst) in self.pipeline_canvas.graph.edges:
+            data['edges'].append({'source': int(src), 'target': int(dst)})
+        return data
+
+    def load_etl_content_into_designer(self, content: dict) -> None:
+        """Carga un contenido de ETL (dict con 'nodes'/'edges') en el Diseñador."""
+        try:
+            # Limpiar actual
+            self.pipeline_canvas.clear_all()
+            if hasattr(self.properties_panel, 'node_configs'):
+                self.properties_panel.node_configs.clear()
+            if hasattr(self.properties_panel, 'current_dataframes'):
+                self.properties_panel.current_dataframes.clear()
+            # Crear nodos
+            for n in content.get('nodes', []):
+                nid = int(n['id'])
+                ntype = n['type']
+                cfg = n.get('config', {})
+                subtype = cfg.get('subtype')
+                pos_dict = n.get('position', {'x': 0.0, 'y': 0.0})
+                pos = QPointF(float(pos_dict.get('x', 0.0)), float(pos_dict.get('y', 0.0)))
+                self.pipeline_canvas.add_node_with_id(nid, ntype, pos, subtype)
+                self.pipeline_canvas.graph.nodes[nid]['config'] = cfg
+                self.properties_panel.node_configs[nid] = cfg
+            # Crear conexiones
+            for e in content.get('edges', []):
+                src = int(e['source'])
+                dst = int(e['target'])
+                self.pipeline_canvas.add_edge_simple(src, dst)
+            self.log_message("ETL cargado en Diseñador desde el Proyecto")
+        except Exception as e:
+            QMessageBox.critical(self, "Proyecto", f"No se pudo cargar el ETL en el Diseñador: {e}")
+
+    def load_etl_from_project(self, etl_id: str) -> None:
+        """Busca un ETL por id en el proyecto y lo carga en el Diseñador."""
+        etls = (self.project_manager.project.get('etls') or []) if isinstance(self.project_manager.project, dict) else []
+        for etl in etls:
+            if str(etl.get('id')) == str(etl_id):
+                self.load_etl_content_into_designer(etl.get('content') or {})
+                try:
+                    idx = self.tabs.indexOf(self.designer_container)
+                    if idx != -1:
+                        self.tabs.setCurrentIndex(idx)
+                except Exception:
+                    pass
+                try:
+                    self._auto_fetch_source_data()
+                except Exception:
+                    pass
+                return
+        QMessageBox.information(self, "Proyecto", f"ETL '{etl_id}' no encontrado en el proyecto.")
+
+    def save_designer_into_etl(self, etl_id: str) -> None:
+        """Serializa el pipeline actual y lo guarda en el ETL indicado dentro del proyecto."""
+        try:
+            content = self.get_current_pipeline_content()
+            etls = (self.project_manager.project.get('etls') or []) if isinstance(self.project_manager.project, dict) else []
+            for idx, etl in enumerate(etls):
+                if str(etl.get('id')) == str(etl_id):
+                    etl['content'] = content
+                    etls[idx] = etl
+                    self.project_manager.project['etls'] = etls
+                    try:
+                        self.project_manager.save()
+                    except Exception:
+                        pass
+                    # Refrescar Explorer si existe
+                    if hasattr(self, 'project_explorer'):
+                        try:
+                            self.project_explorer.refresh()
+                            self.project_explorer.project_changed.emit(self.project_manager.project)
+                        except Exception:
+                            pass
+                    self.log_message(f"ETL '{etl_id}' actualizado desde el Diseñador")
+                    QMessageBox.information(self, "Proyecto", f"ETL '{etl_id}' actualizado desde el Diseñador.")
+                    return
+            QMessageBox.information(self, "Proyecto", f"ETL '{etl_id}' no encontrado en el proyecto.")
+        except Exception as e:
+            QMessageBox.critical(self, "Proyecto", f"No se pudo guardar el Diseñador en el ETL: {e}")
+    
     def _auto_fetch_source_data(self):
         """Obtiene automáticamente los datos para todos los nodos de origen después de cargar un pipeline."""
         try:
@@ -1209,7 +1678,7 @@ class MainWindow(QMainWindow):
             self.properties_panel.current_dataframes[node_id] = df
             
             self.log_message(f"Nodo {node_id}: Datos de BD obtenidos automáticamente ({len(df)} filas)")
-            
+        
         except Exception as e:
             self.log_message(f"Error auto-obteniendo datos de BD del nodo {node_id}: {e}")
     
@@ -1238,7 +1707,7 @@ class MainWindow(QMainWindow):
                         df = pl.read_csv(file_path, encoding='latin-1')
                     except:
                         pdf = pd.read_csv(file_path, encoding='latin-1')
-                        df = pl.from_pandas(pdf)
+                        df = pl.from_pandas(pdf) 
             elif file_type == 'excel':
                 try:
                     df = pl.read_excel(file_path)
@@ -1260,6 +1729,6 @@ class MainWindow(QMainWindow):
             self.properties_panel.current_dataframes[node_id] = df
             
             self.log_message(f"Nodo {node_id}: Archivo {file_type.upper()} cargado automáticamente ({len(df)} filas)")
-            
+        
         except Exception as e:
             self.log_message(f"Error auto-cargando archivo del nodo {node_id}: {e}")
